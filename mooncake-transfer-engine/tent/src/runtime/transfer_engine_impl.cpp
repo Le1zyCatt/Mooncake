@@ -1482,8 +1482,9 @@ Status TransferEngineImpl::commitPreparedSubmit(
         auto& transport = transport_list_[type];
         auto& sub_batch = batch->sub_batch[type];
 
-        // Set device_mask on SubBatch for RDMA transport
-        if (type == RDMA && !task_id_list[type].empty()) {
+        // Set device_mask on SubBatch for transports that perform native
+        // per-device slice scheduling.
+        if ((type == RDMA || type == UB) && !task_id_list[type].empty()) {
             // Use the device_mask from the first task (we assume all tasks in
             // this batch should have the same policy)
             sub_batch->device_mask =
@@ -1661,7 +1662,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto& transport = transport_list_[task.type];
     if (!transport) return finishQueuedOwner(owner_id, FAILED);
     auto& sub_batch = batch->sub_batch[task.type];
-    if (task.type == RDMA) sub_batch->device_mask = task.device_mask;
+    if (task.type == RDMA || task.type == UB)
+        sub_batch->device_mask = task.device_mask;
     task.sub_task_id = sub_batch->size();
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
@@ -1881,6 +1883,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         attachProgressNotifier(batch, batch->sub_batch[type]);
     }
     auto& sub_batch = batch->sub_batch[type];
+    if (type == RDMA || type == UB) sub_batch->device_mask = result.device_mask;
     task.sub_task_id = sub_batch->size();
     task.type = type;
     return transport->submitTransferTasks(sub_batch, {task.request});

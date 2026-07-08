@@ -29,7 +29,7 @@ UbTransport::~UbTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_set_.clear();
 #endif
-    metadata_->removeSegmentDesc(local_server_name_);
+    if (metadata_) metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
     context_list_.clear();
 }
@@ -78,6 +78,138 @@ int UbTransport::install(std::string& local_server_name,
     LOG(INFO) << "UbTransport: publish segments done";
 
     return 0;
+}
+
+int UbTransport::installPrimitive(std::string& local_server_name,
+                                  std::shared_ptr<Topology> topo) {
+    if (topo == nullptr) {
+        LOG(ERROR) << "UbTransport primitive: missing topology";
+        return ERR_INVALID_ARGUMENT;
+    }
+    metadata_.reset();
+    local_server_name_ = local_server_name;
+    local_topology_ = std::move(topo);
+    auto ret = initializeUbResources(this);
+    if (ret) {
+        LOG(ERROR) << "UbTransport primitive: cannot initialize UB resources";
+        uninit(this);
+        return ret;
+    }
+    return 0;
+}
+
+void UbTransport::uninstallPrimitive() {
+    context_list_.clear();
+    uninit(this);
+}
+
+std::vector<UbTransport::NativeDeviceDesc> UbTransport::nativeDevices() {
+    std::vector<NativeDeviceDesc> out;
+    out.reserve(context_list_.size());
+    for (auto& context : context_list_) {
+        NativeDeviceDesc desc;
+        desc.name = context->deviceName();
+        desc.eid = context->getEid();
+        desc.jetty_num = context->nativeJettyNum();
+        out.push_back(std::move(desc));
+    }
+    return out;
+}
+
+int UbTransport::registerLocalMemoryNative(void* addr, size_t length,
+                                           NativeMemoryDesc& desc) {
+    if (context_list_.empty()) {
+        LOG(ERROR) << "UbTransport primitive: no available context";
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
+    int ret = context_list_[0]->registerMemoryRegion((uint64_t)addr, length);
+    if (ret) return ret;
+    void* shared_seg = context_list_[0]->lastRegisteredSeg();
+    if (!shared_seg) {
+        context_list_[0]->unregisterMemoryRegion((uint64_t)addr);
+        return ERR_CONTEXT;
+    }
+
+    for (size_t i = 1; i < context_list_.size(); ++i) {
+        ret =
+            context_list_[i]->adoptLocalSeg((uint64_t)addr, length, shared_seg);
+        if (ret) {
+            for (size_t j = 0; j < i; ++j)
+                context_list_[j]->unregisterMemoryRegion((uint64_t)addr);
+            return ret;
+        }
+    }
+
+    BufferDesc buffer_desc;
+    for (auto& context : context_list_) {
+        ret = context->buildLocalBufferDesc((uint64_t)addr, buffer_desc);
+        if (ret) {
+            for (auto& c : context_list_)
+                c->unregisterMemoryRegion((uint64_t)addr);
+            return ret;
+        }
+    }
+    desc.tseg = std::move(buffer_desc.tseg);
+    desc.l_seg_index = std::move(buffer_desc.l_seg_index);
+    return 0;
+}
+
+int UbTransport::unregisterLocalMemoryNative(void* addr) {
+    for (auto& context : context_list_)
+        context->unregisterMemoryRegion((uint64_t)addr);
+    return 0;
+}
+
+Status UbTransport::submitNativeSlice(const NativeSliceDesc& desc) {
+    if (desc.device_id < 0 ||
+        static_cast<size_t>(desc.device_id) >= context_list_.size()) {
+        return Status::DeviceNotFound(
+            "UbTransport primitive: invalid device id");
+    }
+    auto& context = context_list_[desc.device_id];
+    if (!context || !context->active()) {
+        return Status::DeviceNotFound("UbTransport primitive: device inactive");
+    }
+    void* local_seg = context->localSegWithIndex(desc.local_seg_index);
+    if (!local_seg) {
+        return Status::AddressNotRegistered(
+            "UbTransport primitive: local segment not registered");
+    }
+    void* remote_seg = context->retrieveRemoteSeg(desc.remote_tseg);
+    if (!remote_seg) {
+        return Status::InvalidArgument(
+            "UbTransport primitive: remote UB tseg import failed");
+    }
+
+    Slice* slice = getSliceCache().allocate();
+    slice->source_addr = desc.source;
+    slice->length = desc.length;
+    slice->opcode = desc.opcode == NativeOpCode::Read ? TransferRequest::READ
+                                                      : TransferRequest::WRITE;
+    slice->target_id = 0;
+    slice->peer_nic_path = desc.peer_nic_path;
+    slice->status = Slice::PENDING;
+    slice->task = nullptr;
+    slice->ub.dest_addr = desc.target_addr;
+    slice->ub.retry_cnt = desc.retry_cnt;
+    slice->ub.max_retry_cnt = desc.max_retry_cnt;
+    slice->ub.l_seg = local_seg;
+    slice->ub.r_seg = remote_seg;
+    slice->ub.endpoint = nullptr;
+    slice->native_completion = [completion = desc.completion](Slice* completed,
+                                                              bool success) {
+        if (completion) completion(success, success ? completed->length : 0);
+    };
+
+    std::vector<Slice*> slices{slice};
+    int rc = context->submitNativePostSend(
+        slices, desc.peer_nic_path, desc.remote_eid, desc.remote_jetty_num);
+    if (rc) {
+        return Status::InternalError(
+            "UbTransport primitive: submit native UB slice failed");
+    }
+    return Status::OK();
 }
 
 int UbTransport::registerLocalMemory(void* addr, size_t length,

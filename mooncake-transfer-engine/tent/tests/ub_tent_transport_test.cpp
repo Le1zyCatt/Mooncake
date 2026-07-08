@@ -14,9 +14,9 @@
 //
 // Unit tests for UbTentTransport and the "ub" selector string mapping.
 //
-// These tests run without real Kunpeng hardware.  The UbTransport falls back
-// to mock_urma_device automatically when liburma.so is absent or no real HCA
-// is found (see UbTransport::initializeUbResources()).
+// These tests validate the TENT-native UB execution model. They do not require
+// real Kunpeng hardware because the unit scope exercises native task/slice
+// creation, metadata publication, device-mask selection, and local mock copies.
 //
 // To build and run:
 //   cmake -DUSE_UB=ON -DUSE_TENT=ON ...
@@ -36,11 +36,21 @@
 #include "tent/runtime/platform.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/segment.h"
+#include "tent/thirdparty/nlohmann/json.h"
 #include "tent/transport/ub/ub_tent_transport.h"
 
 namespace mooncake {
 namespace tent {
 namespace {
+
+using json = nlohmann::json;
+
+void* alignedAlloc(size_t bytes) {
+    void* ptr = nullptr;
+    EXPECT_EQ(posix_memalign(&ptr, 4096, bytes), 0);
+    if (ptr) std::memset(ptr, 0, bytes);
+    return ptr;
+}
 
 // ---------------------------------------------------------------------------
 // 1.  Selector / string-mapping tests (no hardware required)
@@ -126,27 +136,16 @@ TEST(UbSelectorTest, SelectorPicksUbWhenFirstInPolicy) {
 }
 
 // ---------------------------------------------------------------------------
-// 2.  UbTentTransport control-flow tests (mock URMA, no network)
+// 2.  UbTentTransport native control-flow tests (no network)
 // ---------------------------------------------------------------------------
 
-// install() with "p2p" metadata (no etcd) and a null Config should succeed
-// when mock URMA is active (no real liburma.so).
 TEST(UbTentTransportTest, InstallWithMockUrma) {
     UbTentTransport transport;
 
     std::string seg_name = "test_segment";
-    // Null ControlService and Topology are accepted; UbTentTransport creates
-    // its own old-TE Topology via discover() and a p2p TransferMetadata.
     auto status = transport.install(seg_name, nullptr, nullptr, nullptr);
 
-    // Success is expected on machines where mock_urma_device is available.
-    // If install fails (e.g. liburma.so found but no real HCA), we still
-    // accept that gracefully and skip dependent sub-tests.
-    if (!status.ok()) {
-        GTEST_SKIP() << "UbTentTransport::install() failed (likely no mock "
-                        "URMA): "
-                     << status.message();
-    }
+    ASSERT_TRUE(status.ok()) << status.message();
     EXPECT_STREQ(transport.getName(), "ub");
     EXPECT_TRUE(transport.capabilities().dram_to_dram);
     EXPECT_FALSE(transport.capabilities().dram_to_gpu);
@@ -165,9 +164,8 @@ TEST(UbTentTransportTest, AddAndRemoveMemoryBuffer) {
     // std::vector uses malloc which only guarantees 16-byte alignment, so we
     // use posix_memalign here instead.
     const size_t kBufLen = 4096;
-    void* addr = nullptr;
-    ASSERT_EQ(posix_memalign(&addr, 4096, kBufLen), 0);
-    std::memset(addr, 0, kBufLen);
+    void* addr = alignedAlloc(kBufLen);
+    ASSERT_NE(addr, nullptr);
 
     BufferDesc desc;
     desc.addr = reinterpret_cast<uint64_t>(addr);
@@ -185,6 +183,14 @@ TEST(UbTentTransportTest, AddAndRemoveMemoryBuffer) {
     EXPECT_NE(it, desc.transports.end())
         << "UB not found in desc.transports after addMemoryBuffer()";
 
+    auto attr_it = desc.transport_attrs.find(UB);
+    ASSERT_NE(attr_it, desc.transport_attrs.end());
+    auto attrs = json::parse(attr_it->second);
+    EXPECT_EQ(attrs.value("version", 0), 1);
+    ASSERT_TRUE(attrs.contains("buffers"));
+    ASSERT_TRUE(attrs["buffers"].contains("tseg"));
+    EXPECT_FALSE(attrs["buffers"]["tseg"].empty());
+
     auto rm_s = transport.removeMemoryBuffer(desc);
     EXPECT_TRUE(rm_s.ok()) << rm_s.message();
 
@@ -192,6 +198,7 @@ TEST(UbTentTransportTest, AddAndRemoveMemoryBuffer) {
     it = std::find(desc.transports.begin(), desc.transports.end(), UB);
     EXPECT_EQ(it, desc.transports.end())
         << "UB still present in desc.transports after removeMemoryBuffer()";
+    EXPECT_EQ(desc.transport_attrs.find(UB), desc.transport_attrs.end());
 
     free(addr);
 }
@@ -214,9 +221,8 @@ TEST(UbTentTransportTest, AllocateAndFreeSubBatch) {
     EXPECT_EQ(batch, nullptr);
 }
 
-// Submit a local-to-local mock transfer and verify that getTransferStatus()
-// returns a terminal state (COMPLETED or FAILED) rather than hanging.
-// This exercises the BatchDesc / TransferTask lifetime path without network.
+// Submit a local-to-local native transfer and verify task status is aggregated
+// from native UbSlice state.
 TEST(UbTentTransportTest, SubmitAndPollMockTransfer) {
     UbTentTransport transport;
     std::string seg_name = "test_segment";
@@ -228,12 +234,11 @@ TEST(UbTentTransportTest, SubmitAndPollMockTransfer) {
     // Allocate page-aligned buffers (urma_register_seg requires 4 KiB
     // alignment).
     const size_t kBufLen = 4096;
-    void* src_raw = nullptr;
-    void* dst_raw = nullptr;
-    ASSERT_EQ(posix_memalign(&src_raw, 4096, kBufLen), 0);
-    ASSERT_EQ(posix_memalign(&dst_raw, 4096, kBufLen), 0);
+    void* src_raw = alignedAlloc(kBufLen);
+    void* dst_raw = alignedAlloc(kBufLen);
+    ASSERT_NE(src_raw, nullptr);
+    ASSERT_NE(dst_raw, nullptr);
     std::memset(src_raw, 0xAB, kBufLen);
-    std::memset(dst_raw, 0x00, kBufLen);
 
     BufferDesc src_desc;
     src_desc.addr = reinterpret_cast<uint64_t>(src_raw);
@@ -262,30 +267,94 @@ TEST(UbTentTransportTest, SubmitAndPollMockTransfer) {
     req.length = kBufLen;
 
     auto sub_s = transport.submitTransferTasks(batch, {req});
-    // submitTransferTasks may fail if mock URMA rejects the send (e.g. no
-    // connected peer).  Accept either outcome; we mainly verify no crash.
-    if (!sub_s.ok()) {
-        LOG(WARNING)
-            << "submitTransferTasks returned non-OK (expected in mock): "
-            << sub_s.message();
-    }
+    ASSERT_TRUE(sub_s.ok()) << sub_s.message();
 
-    // Poll for up to ~1s.
     TransferStatus ts{};
-    bool terminal = false;
-    for (int i = 0; i < 100; ++i) {
-        auto gs = transport.getTransferStatus(batch, 0, ts);
-        if (!gs.ok()) break;
-        if (ts.s == COMPLETED || ts.s == FAILED || ts.s == TIMEOUT) {
-            terminal = true;
-            break;
-        }
-        usleep(10000);  // 10 ms
-    }
-    // In mock mode, completion may not happen; just don't crash/hang.
-    (void)terminal;
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, ts).ok());
+    EXPECT_EQ(ts.s, COMPLETED);
+    EXPECT_EQ(ts.transferred_bytes, kBufLen);
+    EXPECT_EQ(std::memcmp(src_raw, dst_raw, kBufLen), 0);
 
     transport.removeMemoryBuffer(src_desc);
+    transport.freeSubBatch(batch);
+    free(src_raw);
+    free(dst_raw);
+}
+
+TEST(UbTentTransportTest, LargeRequestCreatesMultipleNativeSlices) {
+    auto cfg = std::make_shared<Config>();
+    cfg->set("transports/ub/slice_size", 1024);
+
+    UbTentTransport transport;
+    std::string seg_name = "test_segment";
+    ASSERT_TRUE(transport.install(seg_name, nullptr, nullptr, cfg).ok());
+
+    const size_t kBufLen = 4096;
+    void* src_raw = alignedAlloc(kBufLen);
+    void* dst_raw = alignedAlloc(kBufLen);
+    ASSERT_NE(src_raw, nullptr);
+    ASSERT_NE(dst_raw, nullptr);
+    std::memset(src_raw, 0xCD, kBufLen);
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+
+    Request req{};
+    req.opcode = Request::WRITE;
+    req.source = src_raw;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(dst_raw);
+    req.length = kBufLen;
+
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {req}).ok());
+    auto* ub_batch = dynamic_cast<UbTentTransport::UbSubBatch*>(batch);
+    ASSERT_NE(ub_batch, nullptr);
+    ASSERT_EQ(ub_batch->task_list.size(), 1u);
+    EXPECT_EQ(ub_batch->task_list[0]->slices.size(), 4u);
+
+    TransferStatus ts{};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, ts).ok());
+    EXPECT_EQ(ts.s, COMPLETED);
+    EXPECT_EQ(ts.transferred_bytes, kBufLen);
+
+    transport.freeSubBatch(batch);
+    free(src_raw);
+    free(dst_raw);
+}
+
+TEST(UbTentTransportTest, DeviceMaskRestrictsSelectedDevices) {
+    auto cfg = std::make_shared<Config>();
+    cfg->set("transports/ub/device_name", "ub0,ub1");
+    cfg->set("transports/ub/slice_size", 1024);
+
+    UbTentTransport transport;
+    std::string seg_name = "test_segment";
+    ASSERT_TRUE(transport.install(seg_name, nullptr, nullptr, cfg).ok());
+
+    const size_t kBufLen = 4096;
+    void* src_raw = alignedAlloc(kBufLen);
+    void* dst_raw = alignedAlloc(kBufLen);
+    ASSERT_NE(src_raw, nullptr);
+    ASSERT_NE(dst_raw, nullptr);
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    batch->device_mask = 1ULL << 1;
+
+    Request req{};
+    req.opcode = Request::WRITE;
+    req.source = src_raw;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(dst_raw);
+    req.length = kBufLen;
+
+    ASSERT_TRUE(transport.submitTransferTasks(batch, {req}).ok());
+    auto* ub_batch = dynamic_cast<UbTentTransport::UbSubBatch*>(batch);
+    ASSERT_NE(ub_batch, nullptr);
+    for (const auto& slice : ub_batch->task_list[0]->slices) {
+        EXPECT_EQ(slice.selected_device_id, 1);
+    }
+
     transport.freeSubBatch(batch);
     free(src_raw);
     free(dst_raw);

@@ -42,6 +42,13 @@ class UbWorkerPool {
     // Add slices to queue, called by Transport
     int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
 
+    // Native TENT path: the caller has already resolved peer_nic_path, remote
+    // tseg, local lseg, and device selection from TENT metadata/policy.
+    int submitNativePostSend(const std::vector<Transport::Slice*>& slice_list,
+                             const std::string& peer_nic_path,
+                             const std::string& peer_eid,
+                             const std::vector<uint32_t>& peer_jetty_num);
+
    private:
     void performPostSend(int thread_id);
 
@@ -216,6 +223,13 @@ class UbContext {
 
     virtual int submitPostSend(
         const std::vector<Transport::Slice*>& slice_list) = 0;
+
+    virtual int submitNativePostSend(
+        const std::vector<Transport::Slice*>& slice_list,
+        const std::string& peer_nic_path, const std::string& peer_eid,
+        const std::vector<uint32_t>& peer_jetty_num) = 0;
+
+    virtual std::vector<uint32_t> nativeJettyNum() = 0;
 
     virtual int getAsyncFd() = 0;
 

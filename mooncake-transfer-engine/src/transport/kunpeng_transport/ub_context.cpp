@@ -298,6 +298,46 @@ int UbWorkerPool::submitPostSend(
     return 0;
 }
 
+int UbWorkerPool::submitNativePostSend(
+    const std::vector<Transport::Slice*>& slice_list,
+    const std::string& peer_nic_path, const std::string& peer_eid,
+    const std::vector<uint32_t>& peer_jetty_num) {
+    if (slice_list.empty()) return 0;
+    if (peer_nic_path.empty() || peer_eid.empty() || peer_jetty_num.empty()) {
+        for (auto* slice : slice_list) slice->markFailed();
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    auto endpoint = context_.endpoint(peer_nic_path);
+    if (!endpoint || !endpoint->active()) {
+        for (auto* slice : slice_list) slice->markFailed();
+        return ERR_ENDPOINT;
+    }
+    if (!endpoint->connected() &&
+        endpoint->setupConnectionsNative(peer_eid, peer_jetty_num)) {
+        endpoint->set_active(false);
+        for (auto* slice : slice_list) slice->markFailed();
+        return ERR_ENDPOINT;
+    }
+
+    int shard_id = 0;
+    for (auto c : peer_nic_path) shard_id = (shard_id * 131 + c) % kShardCount;
+    slice_queue_lock_[shard_id].lock();
+    auto& queue = slice_queue_[shard_id][peer_nic_path];
+    for (auto* slice : slice_list) {
+        slice->peer_nic_path = peer_nic_path;
+        slice->ub.endpoint = endpoint.get();
+        queue.push_back(slice);
+    }
+    slice_queue_count_[shard_id].fetch_add(slice_list.size(),
+                                           std::memory_order_relaxed);
+    slice_queue_lock_[shard_id].unlock();
+    submitted_slice_count_.fetch_add(slice_list.size(),
+                                     std::memory_order_relaxed);
+    if (suspended_flag_.load(std::memory_order_relaxed)) cond_var_.notify_all();
+    return 0;
+}
+
 void UbWorkerPool::performPostSend(int thread_id) {
     auto& local_slice_queue = collective_slice_queue_[thread_id];
     for (int shard_id = thread_id; shard_id < kShardCount;
@@ -364,6 +404,18 @@ void UbWorkerPool::performPostSend(int thread_id) {
             if (endpoint->inactiveTime() > 1.0)
                 context_.deleteEndpointByPtr(endpoint.get());
             // enable for re-establishation
+            for (auto& slice : entry.second) failed_slice_list.push_back(slice);
+            entry.second.clear();
+            continue;
+        }
+        bool native_slices = false;
+        for (auto* slice : entry.second) {
+            if (slice->native_completion) {
+                native_slices = true;
+                break;
+            }
+        }
+        if (native_slices && !endpoint->connected()) {
             for (auto& slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
@@ -464,17 +516,33 @@ void UbWorkerPool::performPoll(int thread_id) {
 
 void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                               int thread_id) {
+    std::vector<Transport::Slice*> legacy_slices;
+    for (auto* slice : slice_list) {
+        if (slice->native_completion) {
+            if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
+                slice->markFailed();
+                processed_slice_count_++;
+            } else {
+                collective_slice_queue_[thread_id][slice->peer_nic_path]
+                    .push_back(slice);
+            }
+        } else {
+            legacy_slices.push_back(slice);
+        }
+    }
+    if (legacy_slices.empty()) return;
+
     std::unordered_map<Transport::SegmentID,
                        std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
-    for (auto& slice : slice_list) {
+    for (auto& slice : legacy_slices) {
         auto target_id = slice->target_id;
         if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
                 context_.engine().meta()->getSegmentDescByID(target_id, true);
         }
     }
-    for (auto& slice : slice_list) {
+    for (auto& slice : legacy_slices) {
         if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
             slice->markFailed();
             processed_slice_count_++;

@@ -73,6 +73,20 @@ int UrmaContext::submitPostSend(
     return worker_pool_->submitPostSend(slice_list);
 }
 
+int UrmaContext::submitNativePostSend(
+    const std::vector<Transport::Slice*>& slice_list,
+    const std::string& peer_nic_path, const std::string& peer_eid,
+    const std::vector<uint32_t>& peer_jetty_num) {
+    return worker_pool_->submitNativePostSend(slice_list, peer_nic_path,
+                                              peer_eid, peer_jetty_num);
+}
+
+std::vector<uint32_t> UrmaContext::nativeJettyNum() {
+    auto endpoint = this->endpoint(this->nicPath());
+    if (!endpoint) return {};
+    return endpoint->nativeJettyNum();
+}
+
 int UrmaContext::construct(GlobalConfig& config) {
     size_t num_jfc_list = config.num_jfc_per_ctx;
     size_t num_jfces = config.num_jfce_per_ctx;
@@ -894,6 +908,13 @@ int UrmaEndpoint::setupConnectionsByActive() {
     return ERR_DEVICE_NOT_FOUND;
 }
 
+int UrmaEndpoint::setupConnectionsNative(
+    const std::string& peer_eid, const std::vector<uint32_t>& peer_jetty_num) {
+    RWSpinlock::WriteGuard guard(lock_);
+    if (connected()) return 0;
+    return doSetupConnection(peer_eid, peer_jetty_num);
+}
+
 void UrmaEndpoint::disconnectUnlocked() {
     urma_jetty_attr_t attr;
     memset(&attr, 0, sizeof(attr));
@@ -1066,6 +1087,10 @@ std::vector<uint32_t> UrmaEndpoint::JettyNum() const {
          ++jetty_index)
         ret.push_back(jetty_list_[jetty_index]->jetty_id.id);
     return ret;
+}
+
+std::vector<uint32_t> UrmaEndpoint::nativeJettyNum() const {
+    return JettyNum();
 }
 
 int UrmaEndpoint::doSetupConnection(const std::string& peer_eid,

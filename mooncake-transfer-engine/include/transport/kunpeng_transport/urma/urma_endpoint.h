@@ -67,6 +67,11 @@ class UrmaContext : public UbContext {
     volatile int* outstandingCount(int jfc_index) override;
     int submitPostSend(
         const std::vector<Transport::Slice*>& slice_list) override;
+    int submitNativePostSend(
+        const std::vector<Transport::Slice*>& slice_list,
+        const std::string& peer_nic_path, const std::string& peer_eid,
+        const std::vector<uint32_t>& peer_jetty_num) override;
+    std::vector<uint32_t> nativeJettyNum() override;
     int buildLocalBufferDesc(uint64_t addr,
                              UbTransport::BufferDesc& buffer_desc) override;
     void* localSegWithIndex(unsigned value) override;
@@ -168,6 +173,9 @@ class UrmaEndpoint : public UbEndPoint {
     void setPeerNicPath(const std::string& peer_nic_path) override;
 
     int setupConnectionsByActive() override;
+    int setupConnectionsNative(
+        const std::string& peer_eid,
+        const std::vector<uint32_t>& peer_jetty_num) override;
 
     int setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                   HandShakeDesc& local_desc) override;
@@ -177,6 +185,8 @@ class UrmaEndpoint : public UbEndPoint {
     int submitPostSend(
         std::vector<Transport::Slice*>& slice_list,
         std::vector<Transport::Slice*>& failed_slice_list) override;
+
+    std::vector<uint32_t> nativeJettyNum() const override;
 
     const std::string toString() const override;
 

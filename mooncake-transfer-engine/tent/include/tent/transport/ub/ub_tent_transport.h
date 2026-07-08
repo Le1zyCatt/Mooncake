@@ -11,59 +11,88 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #ifndef UB_TENT_TRANSPORT_H
 #define UB_TENT_TRANSPORT_H
 
-// Old-TE headers first so that common.h declares LOCAL_SEGMENT_ID as a
-// static const before tent/common/types.h redefines it as a macro.
-#include "topology.h"
-#include "transport/transport.h"
-#include "transport/kunpeng_transport/ub_transport.h"
-
-// TENT headers (tent/common/types.h defines #define LOCAL_SEGMENT_ID)
 #include "tent/runtime/transport.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/segment.h"
+#include "tent/runtime/topology.h"
 #include "tent/common/types.h"
 #include "tent/common/config.h"
 #include "tent/common/status.h"
-#include "tent/transport/ub/ub_tent_metadata_bridge.h"
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace mooncake {
+class UbTransport;
+
 namespace tent {
 
-// UbTentTransport adapts the legacy UbTransport (old TE) to the TENT
-// Transport interface.  It reuses the proven URMA data-plane in UbTransport
-// and bridges the semantic gap between TENT's request/segment model and the
-// old TE's BatchID/TransferTask model.
+// UbTentTransport is the TENT-native UB backend. It owns native UB tasks and
+// slices, consumes TENT SegmentDesc metadata directly, and never submits work
+// through the old adapter executor.
 //
 // Threading: install/uninstall are single-threaded; all other methods may be
 // called concurrently from multiple TENT worker threads.
 class UbTentTransport : public Transport {
    public:
-    // SubBatch holds the old-TE BatchID and the converted TransferRequest
-    // objects whose pointers are stored inside the old-TE TransferTask list.
-    // The requests must remain alive until freeSubBatch() is called.
+    struct UbRemoteMetadata {
+        std::string peer_nic_path;
+        std::string remote_tseg;
+        std::string remote_eid;
+        std::vector<uint32_t> remote_jetty_num;
+        int remote_device_id{-1};
+        size_t target_buffer_index{0};
+    };
+
+    struct UbSlice {
+        Request::OpCode opcode{Request::READ};
+        void* source_addr{nullptr};
+        uint64_t target_addr{0};
+        size_t length{0};
+        SegmentID target_id{LOCAL_SEGMENT_ID};
+        UbRemoteMetadata remote;
+        int priority{PRIO_HIGH};
+        int selected_device_id{-1};
+        TransferStatusEnum status{TransferStatusEnum::INITIAL};
+        size_t transferred_bytes{0};
+        uint64_t enqueue_ns{0};
+        uint64_t submit_ns{0};
+        uint64_t complete_ns{0};
+        int retry_count{0};
+    };
+
+    struct UbTask {
+        Request request{};
+        std::vector<UbSlice> slices;
+        TransferStatusEnum status{TransferStatusEnum::INITIAL};
+        size_t transferred_bytes{0};
+        mutable std::mutex mutex;
+    };
+
     struct UbSubBatch : public Transport::SubBatch {
-        // Old TE BatchID (pointer-as-integer to BatchDesc).
-        mooncake::Transport::BatchID ub_batch_id{0};
+        std::vector<std::unique_ptr<UbTask>> task_list;
+        size_t max_size{0};
+        size_t size() const override { return task_list.size(); }
+    };
 
-        // Lifetime-managed copies of converted old-TE requests.
-        // UbTransport::submitTransferTask() stores bare pointers into this
-        // vector, so the vector must not be reallocated after submission.
-        std::vector<mooncake::Transport::TransferRequest> te_requests;
-
-        size_t size() const override { return task_count_; }
-
-       private:
-        friend class UbTentTransport;
-        size_t task_count_{0};
+    struct UbDeviceState {
+        std::string name;
+        int numa_node{0};
+        std::atomic<uint64_t> inflight_bytes{0};
+        std::atomic<uint64_t> completed_bytes{0};
+        std::atomic<uint64_t> failed_count{0};
+        std::atomic<double> ewma_bandwidth_bps{50e9};
+        std::atomic<uint64_t> last_error_ns{0};
+        std::atomic<uint64_t> cooldown_until_ns{0};
     };
 
     UbTentTransport() = default;
@@ -94,33 +123,38 @@ class UbTentTransport : public Transport {
     const char* getName() const override { return "ub"; }
 
    private:
-    // Translate a TENT SegmentID to the corresponding old-TE SegmentID by
-    // looking up the segment name via the TENT SegmentManager and querying
-    // the bridge for the matching ID.
-    mooncake::Transport::SegmentID getTESegmentID(SegmentID tent_id);
+    struct LocalBufferRegistration {
+        uint64_t addr{0};
+        size_t length{0};
+        std::vector<std::string> tseg;
+        std::vector<uint32_t> l_seg_index;
+    };
 
-    // Publish UB device EIDs and buffer tseg handles to the TENT local segment
-    // so that remote nodes can read them via the SegmentManager.
+    size_t sliceSize() const;
     Status setupUbLocalSegment();
+    Status resolveRemoteMetadata(const Request& req, size_t slice_offset,
+                                 size_t length, int preferred_device_id,
+                                 UbRemoteMetadata& remote);
+    Status findLocalSegment(uint64_t addr, size_t length, int device_id,
+                            uint32_t& l_seg_index);
+    Status chooseDevice(uint64_t device_mask, size_t length, int priority,
+                        int& device_id);
+    Status submitRemoteSlice(UbTask& task, UbSlice& slice);
+    void completeSlice(UbSlice& slice, TransferStatusEnum status);
+    void aggregateTask(UbTask& task);
+    uint64_t currentTimeNs() const;
 
    private:
-    // Old-TE UbTransport instance and the topology used during install.
-    std::unique_ptr<mooncake::UbTransport> ub_transport_;
-    std::shared_ptr<mooncake::Topology> te_topology_;
-
-    // Bridge: replaces the standalone te_metadata_; routes remote lookups to
-    // the TENT SegmentManager and makes the handshake daemon a no-op.
-    std::shared_ptr<UbTentMetadataBridge> te_metadata_bridge_;
-
-    // TENT control plane (for segment synchronization and RPC).
+    bool installed_{false};
+    std::shared_ptr<Config> conf_;
+    std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> control_service_;
-
     std::string local_segment_name_;
-
-    // Cache: TENT SegmentID → old-TE SegmentID.
-    std::mutex seg_id_cache_mutex_;
-    std::unordered_map<SegmentID, mooncake::Transport::SegmentID>
-        tent_to_te_seg_id_;
+    std::unique_ptr<mooncake::UbTransport> ub_primitive_;
+    std::vector<std::unique_ptr<UbDeviceState>> devices_;
+    std::mutex device_mutex_;
+    std::vector<LocalBufferRegistration> registered_buffers_;
+    std::mutex registered_buffers_mutex_;
 };
 
 }  // namespace tent

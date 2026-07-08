@@ -125,6 +125,10 @@ class Transport {
 #endif
         std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
+        // Optional native completion path used by transports that reuse the
+        // low-level post/poll primitive without using TransferTask/BatchDesc as
+        // their execution model. Legacy transports leave this unset.
+        std::function<void(Slice *slice, bool success)> native_completion;
 
         union {
             struct {
@@ -180,6 +184,13 @@ class Transport {
 
        public:
         void markSuccess() {
+            if (native_completion) {
+                status = Slice::SUCCESS;
+                native_completion(this, true);
+                native_completion = nullptr;
+                Transport::getSliceCache().deallocate(this);
+                return;
+            }
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
@@ -189,6 +200,13 @@ class Transport {
         }
 
         void markFailed() {
+            if (native_completion) {
+                status = Slice::FAILED;
+                native_completion(this, false);
+                native_completion = nullptr;
+                Transport::getSliceCache().deallocate(this);
+                return;
+            }
             status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
 

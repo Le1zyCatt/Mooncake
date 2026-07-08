@@ -41,6 +41,10 @@ class UbEndPoint {
 
     virtual int setupConnectionsByActive() = 0;
 
+    virtual int setupConnectionsNative(
+        const std::string& peer_eid,
+        const std::vector<uint32_t>& peer_jetty_num) = 0;
+
     virtual int setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                           HandShakeDesc& local_desc) = 0;
 
@@ -49,6 +53,8 @@ class UbEndPoint {
     virtual int submitPostSend(
         std::vector<Transport::Slice*>& slice_list,
         std::vector<Transport::Slice*>& failed_slice_list) = 0;
+
+    virtual std::vector<uint32_t> nativeJettyNum() const = 0;
 
     virtual const std::string toString() const = 0;
 

@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <functional>
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -65,6 +66,44 @@ class UbTransport : public Transport {
         const std::vector<void*>& addr_list) override;
 
     const char* getName() const override { return "ub"; }
+
+    struct NativeDeviceDesc {
+        std::string name;
+        std::string eid;
+        std::vector<uint32_t> jetty_num;
+    };
+
+    struct NativeMemoryDesc {
+        std::vector<std::string> tseg;
+        std::vector<uint32_t> l_seg_index;
+    };
+
+    enum class NativeOpCode { Read, Write };
+
+    struct NativeSliceDesc {
+        NativeOpCode opcode;
+        void* source;
+        uint64_t target_addr;
+        size_t length;
+        int device_id;
+        uint32_t local_seg_index;
+        std::string peer_nic_path;
+        std::string remote_eid;
+        std::vector<uint32_t> remote_jetty_num;
+        std::string remote_tseg;
+        uint32_t retry_cnt;
+        uint32_t max_retry_cnt;
+        std::function<void(bool success, size_t bytes)> completion;
+    };
+
+    int installPrimitive(std::string& local_server_name,
+                         std::shared_ptr<Topology> topo);
+    void uninstallPrimitive();
+    std::vector<NativeDeviceDesc> nativeDevices();
+    int registerLocalMemoryNative(void* addr, size_t length,
+                                  NativeMemoryDesc& desc);
+    int unregisterLocalMemoryNative(void* addr);
+    Status submitNativeSlice(const NativeSliceDesc& desc);
 
     // TRANSFER
 
