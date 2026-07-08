@@ -206,8 +206,11 @@ Status UbTransport::submitNativeSlice(const NativeSliceDesc& desc) {
     int rc = context->submitNativePostSend(
         slices, desc.peer_nic_path, desc.remote_eid, desc.remote_jetty_num);
     if (rc) {
-        return Status::InternalError(
-            "UbTransport primitive: submit native UB slice failed");
+        // submitNativePostSend reports immediate endpoint/setup failures
+        // through slice->markFailed(), which invokes native_completion and
+        // recycles the low-level Slice. Returning OK avoids a second completion
+        // path in the TENT-native owner.
+        return Status::OK();
     }
     return Status::OK();
 }

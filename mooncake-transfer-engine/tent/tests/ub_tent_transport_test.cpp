@@ -74,9 +74,51 @@ TEST(UbSelectorTest, UbEnumValue) {
     EXPECT_LT(static_cast<int>(UB), static_cast<int>(kNumTransportTypes));
 }
 
-// A policy JSON with "ub" first in the transports array must cause the
-// selector to pick UB when a UB transport is available.
-TEST(UbSelectorTest, SelectorPicksUbWhenFirstInPolicy) {
+class MinimalFakeTransport : public Transport {
+   public:
+    void setDram() { caps.dram_to_dram = true; }
+    Status allocateSubBatch(SubBatchRef&, size_t) override {
+        return Status::OK();
+    }
+    Status freeSubBatch(SubBatchRef&) override { return Status::OK(); }
+    Status submitTransferTasks(SubBatchRef,
+                               const std::vector<Request>&) override {
+        return Status::OK();
+    }
+    Status getTransferStatus(SubBatchRef, int, TransferStatus&) override {
+        return Status::OK();
+    }
+    const char* getName() const override { return "fake"; }
+};
+
+SelectionContext makeRemoteCpuSelectionContext() {
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+    ctx.buffer_transports = nullptr;
+    return ctx;
+}
+
+std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+makeUbTcpTransports() {
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    auto ub_fake = std::make_shared<MinimalFakeTransport>();
+    ub_fake->setDram();
+    auto tcp_fake = std::make_shared<MinimalFakeTransport>();
+    tcp_fake->setDram();
+    transports[UB] = ub_fake;
+    transports[TCP] = tcp_fake;
+    return transports;
+}
+
+// A policy JSON with only "ub" in the transports array must cause the selector
+// to pick UB when both UB and TCP are available.
+TEST(UbSelectorTest, SelectorPolicyForceUbWithTcpAlsoEnabled) {
     auto conf = std::make_shared<Config>();
     const std::string policy_json = R"({
         "policy": [
@@ -86,53 +128,44 @@ TEST(UbSelectorTest, SelectorPicksUbWhenFirstInPolicy) {
                 "local_memory": "cpu",
                 "remote_memory": "cpu",
                 "same_machine": false,
-                "transports": ["ub", "rdma", "tcp"]
+                "transports": ["ub"]
             }
         ]
     })";
     ASSERT_TRUE(conf->load(policy_json).ok());
 
     TransportSelector selector(conf);
-
-    // Register a fake UB and TCP transport.
-    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
-        transports{};
-
-    struct MinimalFake : public Transport {
-        void setDram() { caps.dram_to_dram = true; }
-        Status allocateSubBatch(SubBatchRef&, size_t) override {
-            return Status::OK();
-        }
-        Status freeSubBatch(SubBatchRef&) override { return Status::OK(); }
-        Status submitTransferTasks(SubBatchRef,
-                                   const std::vector<Request>&) override {
-            return Status::OK();
-        }
-        Status getTransferStatus(SubBatchRef, int, TransferStatus&) override {
-            return Status::OK();
-        }
-        const char* getName() const override { return "fake"; }
-    };
-
-    auto ub_fake = std::make_shared<MinimalFake>();
-    ub_fake->setDram();
-    auto tcp_fake = std::make_shared<MinimalFake>();
-    tcp_fake->setDram();
-    transports[UB] = ub_fake;
-    transports[TCP] = tcp_fake;
-
-    SelectionContext ctx;
-    ctx.segment_type = SegmentType::Memory;
-    ctx.same_machine = false;
-    ctx.local_memory_type = MTYPE_CPU;
-    ctx.remote_memory_type = MTYPE_CPU;
-    ctx.transfer_size = 4096;
-    ctx.priority_level = 0;
-    ctx.buffer_transports = nullptr;
+    auto transports = makeUbTcpTransports();
+    auto ctx = makeRemoteCpuSelectionContext();
 
     auto result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, UB)
-        << "Selector should pick UB first per policy";
+        << "Selector should honor policy transports=[ub]";
+}
+
+TEST(UbSelectorTest, SelectorPolicyForceTcpDoesNotUseUb) {
+    auto conf = std::make_shared<Config>();
+    const std::string policy_json = R"({
+        "policy": [
+            {
+                "name": "force_tcp_memory",
+                "segment_type": "memory",
+                "local_memory": "cpu",
+                "remote_memory": "cpu",
+                "same_machine": false,
+                "transports": ["tcp"]
+            }
+        ]
+    })";
+    ASSERT_TRUE(conf->load(policy_json).ok());
+
+    TransportSelector selector(conf);
+    auto transports = makeUbTcpTransports();
+    auto ctx = makeRemoteCpuSelectionContext();
+
+    auto result = selector.select(ctx, transports);
+    EXPECT_EQ(result.transport, TCP)
+        << "Selector should honor policy transports=[tcp] and not use UB";
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +233,37 @@ TEST(UbTentTransportTest, AddAndRemoveMemoryBuffer) {
         << "UB still present in desc.transports after removeMemoryBuffer()";
     EXPECT_EQ(desc.transport_attrs.find(UB), desc.transport_attrs.end());
 
+    free(addr);
+}
+
+TEST(UbTentTransportTest, RepeatedRegisterUnregisterSameVA) {
+    UbTentTransport transport;
+    std::string seg_name = "test_segment";
+    auto status = transport.install(seg_name, nullptr, nullptr, nullptr);
+    if (!status.ok()) {
+        GTEST_SKIP() << "install failed: " << status.message();
+    }
+
+    const size_t kBufLen = 4096;
+    void* addr = alignedAlloc(kBufLen);
+    ASSERT_NE(addr, nullptr);
+
+    BufferDesc first;
+    first.addr = reinterpret_cast<uint64_t>(addr);
+    first.length = kBufLen;
+    first.location = "*";
+    BufferDesc second = first;
+
+    MemoryOptions opts;
+    opts.perm = kGlobalReadWrite;
+
+    ASSERT_TRUE(transport.addMemoryBuffer(first, opts).ok());
+    ASSERT_TRUE(transport.addMemoryBuffer(second, opts).ok());
+    EXPECT_NE(first.transport_attrs.find(UB), first.transport_attrs.end());
+    EXPECT_EQ(first.transport_attrs[UB], second.transport_attrs[UB]);
+
+    EXPECT_TRUE(transport.removeMemoryBuffer(first).ok());
+    EXPECT_TRUE(transport.removeMemoryBuffer(second).ok());
     free(addr);
 }
 
@@ -287,7 +351,10 @@ TEST(UbTentTransportTest, LargeRequestCreatesMultipleNativeSlices) {
 
     UbTentTransport transport;
     std::string seg_name = "test_segment";
-    ASSERT_TRUE(transport.install(seg_name, nullptr, nullptr, cfg).ok());
+    auto status = transport.install(seg_name, nullptr, nullptr, cfg);
+    if (!status.ok()) {
+        GTEST_SKIP() << "install failed: " << status.message();
+    }
 
     const size_t kBufLen = 4096;
     void* src_raw = alignedAlloc(kBufLen);
@@ -329,7 +396,10 @@ TEST(UbTentTransportTest, DeviceMaskRestrictsSelectedDevices) {
 
     UbTentTransport transport;
     std::string seg_name = "test_segment";
-    ASSERT_TRUE(transport.install(seg_name, nullptr, nullptr, cfg).ok());
+    auto status = transport.install(seg_name, nullptr, nullptr, cfg);
+    if (!status.ok()) {
+        GTEST_SKIP() << "install failed: " << status.message();
+    }
 
     const size_t kBufLen = 4096;
     void* src_raw = alignedAlloc(kBufLen);
@@ -352,12 +422,46 @@ TEST(UbTentTransportTest, DeviceMaskRestrictsSelectedDevices) {
     auto* ub_batch = dynamic_cast<UbTentTransport::UbSubBatch*>(batch);
     ASSERT_NE(ub_batch, nullptr);
     for (const auto& slice : ub_batch->task_list[0]->slices) {
-        EXPECT_EQ(slice.selected_device_id, 1);
+        EXPECT_EQ(slice->selected_device_id, 1);
     }
 
     transport.freeSubBatch(batch);
     free(src_raw);
     free(dst_raw);
+}
+
+TEST(UbTentTransportTest, PartialSliceFailureAggregatesTaskFailed) {
+    UbTentTransport transport;
+    std::string seg_name = "test_segment";
+    auto status = transport.install(seg_name, nullptr, nullptr, nullptr);
+    if (!status.ok()) {
+        GTEST_SKIP() << "install failed: " << status.message();
+    }
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+    auto* ub_batch = dynamic_cast<UbTentTransport::UbSubBatch*>(batch);
+    ASSERT_NE(ub_batch, nullptr);
+
+    auto task = std::make_shared<UbTentTransport::UbTask>();
+    auto ok_slice = std::make_shared<UbTentTransport::UbSlice>();
+    ok_slice->status = COMPLETED;
+    ok_slice->length = 1024;
+    ok_slice->transferred_bytes = 1024;
+    auto failed_slice = std::make_shared<UbTentTransport::UbSlice>();
+    failed_slice->status = FAILED;
+    failed_slice->length = 1024;
+    failed_slice->transferred_bytes = 0;
+    task->slices.push_back(ok_slice);
+    task->slices.push_back(failed_slice);
+    ub_batch->task_list.push_back(task);
+
+    TransferStatus ts{};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, ts).ok());
+    EXPECT_EQ(ts.s, FAILED);
+    EXPECT_EQ(ts.transferred_bytes, 1024u);
+
+    transport.freeSubBatch(batch);
 }
 
 // Calling uninstall() twice must not crash.

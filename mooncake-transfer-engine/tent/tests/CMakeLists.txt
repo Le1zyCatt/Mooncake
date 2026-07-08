@@ -1,9 +1,9 @@
 # TENT Tests and Examples
 
-# tent_xport_ub embeds old-TE ub_transport objects.  Executables that link
-# tent_link_group must also link transfer_engine for TransferMetadata and
-# related symbols.  Keep this at the test executable level to avoid a CMake
-# target cycle (transfer_engine already links tent_link_group when USE_TENT).
+# When USE_UB is enabled, tent_xport_ub uses the Kunpeng UB primitive objects
+# supplied by transfer_engine. Keep this at the test executable level to avoid a
+# CMake target cycle (transfer_engine already links tent_link_group when
+# USE_TENT).
 set(TENT_GTEST_LINK_LIBS gtest gtest_main tent_link_group)
 if(USE_UB AND TARGET transfer_engine)
   list(APPEND TENT_GTEST_LINK_LIBS transfer_engine)

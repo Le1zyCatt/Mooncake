@@ -21,9 +21,11 @@
 #include "tent/common/types.h"
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/transport/ub/ub_native_primitive.h"
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,13 +34,15 @@
 #include <vector>
 
 namespace mooncake {
-class UbTransport;
-
 namespace tent {
 
 // UbTentTransport is the TENT-native UB backend. It owns native UB tasks and
 // slices, consumes TENT SegmentDesc metadata directly, and never submits work
 // through the old adapter executor.
+//
+// UB-internal chunking below is only the UB backend's work-request granularity.
+// Cross-transport partitioning, failover, and heterogeneous scheduling stay in
+// the TENT runtime scheduler.
 //
 // Threading: install/uninstall are single-threaded; all other methods may be
 // called concurrently from multiple TENT worker threads.
@@ -50,10 +54,12 @@ class UbTentTransport : public Transport {
         std::string remote_eid;
         std::vector<uint32_t> remote_jetty_num;
         int remote_device_id{-1};
+        std::string remote_device_name;
         size_t target_buffer_index{0};
     };
 
     struct UbSlice {
+        size_t id{0};
         Request::OpCode opcode{Request::READ};
         void* source_addr{nullptr};
         uint64_t target_addr{0};
@@ -72,14 +78,16 @@ class UbTentTransport : public Transport {
 
     struct UbTask {
         Request request{};
-        std::vector<UbSlice> slices;
+        std::vector<std::shared_ptr<UbSlice>> slices;
         TransferStatusEnum status{TransferStatusEnum::INITIAL};
         size_t transferred_bytes{0};
+        size_t in_flight_slices{0};
         mutable std::mutex mutex;
+        std::condition_variable cv;
     };
 
     struct UbSubBatch : public Transport::SubBatch {
-        std::vector<std::unique_ptr<UbTask>> task_list;
+        std::vector<std::shared_ptr<UbTask>> task_list;
         size_t max_size{0};
         size_t size() const override { return task_list.size(); }
     };
@@ -128,6 +136,8 @@ class UbTentTransport : public Transport {
         size_t length{0};
         std::vector<std::string> tseg;
         std::vector<uint32_t> l_seg_index;
+        size_t ref_count{1};
+        size_t in_flight_slices{0};
     };
 
     size_t sliceSize() const;
@@ -135,11 +145,23 @@ class UbTentTransport : public Transport {
     Status resolveRemoteMetadata(const Request& req, size_t slice_offset,
                                  size_t length, int preferred_device_id,
                                  UbRemoteMetadata& remote);
-    Status findLocalSegment(uint64_t addr, size_t length, int device_id,
-                            uint32_t& l_seg_index);
+    Status reserveLocalSegment(
+        uint64_t addr, size_t length, int device_id, uint32_t& l_seg_index,
+        std::shared_ptr<LocalBufferRegistration>& registration);
+    void releaseLocalSegment(
+        const std::shared_ptr<LocalBufferRegistration>& registration);
     Status chooseDevice(uint64_t device_mask, size_t length, int priority,
                         int& device_id);
-    Status submitRemoteSlice(UbTask& task, UbSlice& slice);
+    void releaseDeviceInflight(int device_id, size_t length);
+    Status submitRemoteSlice(const std::shared_ptr<UbTask>& task,
+                             const std::shared_ptr<UbSlice>& slice);
+    void finishRemoteSlice(
+        const std::shared_ptr<UbTask>& task,
+        const std::shared_ptr<UbSlice>& slice,
+        const std::shared_ptr<LocalBufferRegistration>& registration,
+        TransferStatusEnum status, size_t transferred_bytes);
+    void drainTask(const std::shared_ptr<UbTask>& task);
+    void drainAllInflight();
     void completeSlice(UbSlice& slice, TransferStatusEnum status);
     void aggregateTask(UbTask& task);
     uint64_t currentTimeNs() const;
@@ -150,11 +172,15 @@ class UbTentTransport : public Transport {
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> control_service_;
     std::string local_segment_name_;
-    std::unique_ptr<mooncake::UbTransport> ub_primitive_;
+    std::unique_ptr<UbNativePrimitive> ub_primitive_;
     std::vector<std::unique_ptr<UbDeviceState>> devices_;
     std::mutex device_mutex_;
-    std::vector<LocalBufferRegistration> registered_buffers_;
+    std::vector<std::shared_ptr<LocalBufferRegistration>> registered_buffers_;
     std::mutex registered_buffers_mutex_;
+    std::atomic<bool> accepting_submissions_{false};
+    size_t in_flight_slices_{0};
+    std::mutex inflight_mutex_;
+    std::condition_variable inflight_cv_;
 };
 
 }  // namespace tent

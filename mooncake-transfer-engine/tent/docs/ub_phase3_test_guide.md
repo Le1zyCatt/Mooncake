@@ -1,23 +1,29 @@
 # TENT UB Transport Phase 3 Test Guide
 
-This guide documents how to validate UB transport support in TENT on the `UB_TENT` branch.
+This guide documents how to validate UB transport support in TENT on the
+`ub-tent-native-migration-plan` branch.
 
-This document focuses on the current Phase 3 work in this branch: enabling the existing Kunpeng UB/URMA data path to be reused by TENT through a TENT transport adapter, metadata bridge, and control-plane bootstrap path.
+This branch provides a TENT-native UB execution path using native UB
+primitives. It supports UB-internal chunking and UB-internal device selection,
+but cross-transport slice partitioning remains a TENT runtime scheduler
+responsibility.
 
 ## 1. Scope
 
-Compared with `main`, this branch adds TENT-side support for UB transport and adjusts the existing old Transfer Engine UB implementation so that it can be reused by TENT.
+Compared with `main`, this branch adds TENT-side support for UB transport and
+wraps the existing Kunpeng URMA primitives behind a narrow native primitive
+layer.
 
 | Area                     | `main`                                     | `UB_TENT`                                                          |
 | ------------------------ | ------------------------------------------ | ------------------------------------------------------------------ |
 | TENT transport enum      | No `UB` transport type                     | Adds `TransportType::UB`                                           |
 | Transport selector       | Cannot parse or select `"ub"`              | Supports `"ub"` as a transport policy entry                        |
 | Transport loader         | Cannot instantiate UB in TENT              | Creates `UbTentTransport` when UB is enabled                       |
-| TENT UB adapter          | Not available                              | Adds `UbTentTransport`                                             |
-| Metadata bridge          | Old UB depends on old `TransferMetadata`   | Adds `UbTentMetadataBridge` to resolve TENT segments for old UB    |
-| UB bootstrap             | Old UB handshake path only                 | Adds TENT `BootstrapUb` RPC path                                   |
+| TENT UB backend          | Not available                              | Adds `UbTentTransport`                                             |
+| Primitive layer          | Old UB owns task/batch execution           | Adds `UbNativePrimitive` wrapper for URMA register/post/poll       |
+| UB bootstrap             | Old UB handshake path only                 | Native path consumes TENT UB device attrs for endpoint setup       |
 | Local segment publishing | No UB-specific TENT attrs                  | Publishes UB EID and tseg data through TENT transport attrs        |
-| Submit fallback          | Submit failure may not be retried cleanly  | Allows failed sub-batches to be retried through poll-time failover |
+| Submit fallback          | Submit failure may not be retried cleanly  | Reports native UB task failure to TENT for runtime-level failover  |
 | URMA registration        | Multiple contexts may register the same VA | Primary context registers once; other contexts adopt the segment   |
 | Tests                    | No TENT UB tests                           | Adds `tent_ub_transport_test` and `tent_ub_e2e_dual_node_test`     |
 
@@ -118,14 +124,15 @@ GLOG_logtostderr=1 \
 | `UbSelectorTest.ParseUbString`                    | Verifies that `"ub"` parses to `TransportType::UB`                                       |
 | `UbSelectorTest.ParseUnknownStillReturnsUnspec`   | Verifies that unknown transport strings still return `UNSPEC`                            |
 | `UbSelectorTest.UbEnumValue`                      | Verifies that the UB enum value is inside the supported transport range                  |
-| `UbSelectorTest.SelectorPicksUbWhenFirstInPolicy` | Verifies that a policy with `"ub"` first can select UB when UB is available              |
+| `UbSelectorTest.SelectorPolicyForceUbWithTcpAlsoEnabled` | Verifies that policy `transports=["ub"]` selects UB even when TCP is enabled      |
+| `UbSelectorTest.SelectorPolicyForceTcpDoesNotUseUb`      | Verifies that policy `transports=["tcp"]` does not use UB                         |
 | `UbTentTransportTest.InstallWithMockUrma`         | Verifies basic install lifecycle with mock URMA and checks the transport name/capability |
 | `UbTentTransportTest.AddAndRemoveMemoryBuffer`    | Verifies page-aligned memory add/remove flow and updates to `desc.transports`            |
-| `UbTentTransportTest.AllocateAndFreeSubBatch`     | Verifies sub-batch allocation and release through the old UB batch path                  |
-| `UbTentTransportTest.SubmitAndPollMockTransfer`   | Verifies that the mock submit/poll path does not crash or hang                           |
+| `UbTentTransportTest.AllocateAndFreeSubBatch`     | Verifies native sub-batch allocation and release                                         |
+| `UbTentTransportTest.SubmitAndPollMockTransfer`   | Verifies local native chunk status aggregation                                           |
 | `UbTentTransportTest.DoubleUninstallSafe`         | Verifies that repeated uninstall is safe                                                 |
 
-The unit test mainly covers selector mapping, adapter lifecycle, memory buffer lifecycle, sub-batch lifecycle, and mock transfer smoke behavior.
+The unit test mainly covers selector mapping, native backend lifecycle, memory buffer lifecycle, sub-batch lifecycle, and mock transfer smoke behavior.
 
 It does not prove that the real UB data plane completes on hardware. It also does not fully assert the serialized `transport_attrs[UB]` content. That deeper validation belongs to the dual-node integration test and hardware inspection.
 
@@ -234,35 +241,38 @@ BufferDesc.transport_attrs[UB] contains the UB tseg handle after memory registra
 BufferDesc.transports contains TransportType::UB after successful registration.
 ```
 
-This is needed because the remote node reconstructs the old-TE UB segment descriptor from TENT metadata.
+This is needed because the remote node consumes TENT `SegmentDesc` metadata
+directly when building native UB primitive work requests.
 
-### 5.5 Metadata Bridge
+### 5.5 Native Primitive Boundary
 
-`UbTentMetadataBridge` allows old UB code to resolve TENT segments through the old `TransferMetadata` interface.
+`UbNativePrimitive` is the only layer that touches the existing Kunpeng UB/URMA
+implementation. It exposes memory registration, remote tseg import, endpoint
+setup, post send, and completion callbacks. It does not expose old TE
+classic TE task or batch semantics to `UbTentTransport`.
 
 Expected behavior:
 
 ```text
-Remote getSegmentDescByID() uses the TENT SegmentManager remote cache.
-force_update=true invalidates both bridge-side and TENT-side remote cache.
-getSegmentDescByName() opens the remote TENT segment and converts it.
-getSegmentID(name) returns the TENT remote segment handle as the old-TE segment ID.
-convertFromTent() extracts UB EID and tseg data from TENT transport attrs.
+UbTentTransport parses remote TENT SegmentDesc.transport_attrs[UB].
+UbTentTransport performs UB-internal chunking only after TENT selects UB.
+UbNativePrimitive submits native UB primitive slices.
+Completion callbacks update native UbSlice/UbTask state.
 ```
 
-### 5.6 UB Bootstrap Through TENT RPC
+### 5.6 UB Endpoint Setup
 
-The old UB handshake daemon is not started by the bridge. Instead, UB endpoint bootstrap is routed through TENT control-plane RPC.
+The native path publishes UB EID and jetty information in TENT device attrs.
+Endpoint setup consumes these attrs directly through the UB primitive layer.
 
 Expected call path:
 
 ```text
-UbEndpoint
-  -> TransferMetadata::sendHandshake()
-  -> UbTentMetadataBridge::sendHandshake()
-  -> ControlClient::bootstrapUb()
-  -> remote ControlService::onBootstrapUb()
-  -> old-TE UB handshake callback
+TENT selector chooses UB
+  -> UbTentTransport creates UB-internal chunks
+  -> UbTentTransport resolves remote SegmentDesc.transport_attrs[UB]
+  -> UbNativePrimitive sets up the UB endpoint with remote EID/jetty attrs
+  -> UB primitive post/poll completes native UbSlice state
 ```
 
 `UbBootstrapDesc` should carry:
@@ -490,10 +500,10 @@ The dual-node integration test validates:
 2. UB EID publication through TENT segment device attrs
 3. UB tseg publication through TENT buffer attrs
 4. Client-side remote segment open
-5. Metadata conversion through UbTentMetadataBridge
-6. TENT request conversion through UbTentTransport
-7. UB endpoint bootstrap through BootstrapUb RPC
-8. Old-TE UB data path reuse from TENT
+5. Native remote metadata parsing through TENT SegmentDesc attrs
+6. UB-internal chunk creation through UbTentTransport
+7. UB endpoint setup through native UB device attrs
+8. Native UB primitive post/poll completion callbacks
 9. Remote WRITE
 10. Remote READ
 11. Data integrity after write + read-back
@@ -508,7 +518,7 @@ The dual-node integration test validates:
 | Wrong UB device selected           | Set `transports.ub.device_name` or `MC_UB_DEVICE_NAME` explicitly                                                               |
 | Remote segment has no buffers      | Confirm server-side memory registration succeeded and segment synchronization reached metadata                                  |
 | Remote segment has no UB attrs     | Confirm UB transport installation happened before segment synchronization                                                       |
-| `BootstrapUb` RPC failed           | Check `rpc_server_hostname`, firewall, remote RPC reachability, and callback registration                                       |
+| UB endpoint setup failed           | Check published UB EID/jetty attrs, fabric reachability, and endpoint setup logs                                                |
 | URMA duplicate registration error  | Confirm the branch includes the primary-register plus adopt-segment lifecycle change                                            |
 | Transfer hangs                     | Check UB fabric connectivity, selected UB device, endpoint creation logs, and poll/fallback logs                                |
 | Data mismatch                      | Use `--operation=write`, confirm both nodes use the same `data_size`, and make sure no unintended fallback transport is enabled |
@@ -575,7 +585,7 @@ build-ub-tent/mooncake-transfer-engine/tests/ub_transport_test \
 | Test                            |                                 Hardware | CTest | Coverage                                                                                                                        |
 | ------------------------------- | ---------------------------------------: | ----: | ------------------------------------------------------------------------------------------------------------------------------- |
 | `tent_ub_transport_test`        | No real UB hardware if mock URMA is used |   Yes | UB enum/string mapping, selector, install lifecycle, memory registration lifecycle, sub-batch lifecycle, mock submit/poll smoke |
-| `tent_ub_e2e_dual_node_test`    |        Yes, two Kunpeng UB-capable nodes |    No | TENT segment publishing, metadata bridge, BootstrapUb RPC, old-TE UB data path through TENT, data integrity                     |
+| `tent_ub_e2e_dual_node_test`    |        Yes, two Kunpeng UB-capable nodes |    No | TENT segment publishing, native UB metadata parsing, UB primitive post/poll, data integrity                                    |
 | `tent_engine_failover_e2e_test` |                                       No |   Yes | Submit-failure poll-time resubmit behavior                                                                                      |
 | `tent_transport_hint_test`      |                                       No |   Yes | Transport hint behavior after adding UB                                                                                         |
 | `tent_transport_selector_test`  |                                       No |   Yes | Selector regression around transport policy handling                                                                            |
@@ -634,6 +644,6 @@ A complete validation should include:
 4. Run old Transfer Engine ub_transport_test when the environment allows it.
 5. Run tent_ub_e2e_dual_node_test on two Kunpeng UB-capable nodes.
 6. Confirm metadata contains UB EID and tseg attrs.
-7. Confirm BootstrapUb RPC is exercised during connection setup.
+7. Confirm native UB endpoint setup consumes published EID/jetty attrs.
 8. Confirm write + read-back data integrity in the dual-node test.
 ```

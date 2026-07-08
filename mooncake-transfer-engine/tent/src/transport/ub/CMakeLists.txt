@@ -1,10 +1,10 @@
 if(USE_UB)
   file(GLOB UB_TENT_SOURCES "*.cpp")
 
-  # Keep this library limited to the TENT UB adapter sources.  The old-TE
-  # ub_transport objects are already provided by the transfer_engine target when
-  # USE_UB is enabled; embedding them here as well makes final executables link
-  # the same object files twice.
+  # Keep this library limited to the TENT UB backend and native primitive
+  # wrapper sources. The underlying Kunpeng UB objects are provided by
+  # transfer_engine when USE_UB is enabled; embedding them here as well would
+  # link those object files twice.
   add_library(tent_xport_ub STATIC ${UB_TENT_SOURCES})
 
   # Old-TE public headers (transfer_metadata.h, topology.h, transport/*.h).
