@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -37,6 +38,7 @@
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/segment.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/ub/ub_metadata_attrs.h"
 #include "tent/transport/ub/ub_tent_transport.h"
 
 namespace mooncake {
@@ -116,6 +118,15 @@ makeUbTcpTransports() {
     return transports;
 }
 
+std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+makeUbRdmaTcpTransports() {
+    auto transports = makeUbTcpTransports();
+    auto rdma_fake = std::make_shared<MinimalFakeTransport>();
+    rdma_fake->setDram();
+    transports[RDMA] = rdma_fake;
+    return transports;
+}
+
 // A policy JSON with only "ub" in the transports array must cause the selector
 // to pick UB when both UB and TCP are available.
 TEST(UbSelectorTest, SelectorPolicyForceUbWithTcpAlsoEnabled) {
@@ -166,6 +177,125 @@ TEST(UbSelectorTest, SelectorPolicyForceTcpDoesNotUseUb) {
     auto result = selector.select(ctx, transports);
     EXPECT_EQ(result.transport, TCP)
         << "Selector should honor policy transports=[tcp] and not use UB";
+}
+
+TEST(UbSelectorTest, SelectorPolicyUbRdmaTcpPriority) {
+    auto conf = std::make_shared<Config>();
+    const std::string policy_json = R"({
+        "policy": [
+            {
+                "name": "ub_rdma_tcp_memory",
+                "segment_type": "memory",
+                "local_memory": "cpu",
+                "remote_memory": "cpu",
+                "same_machine": false,
+                "transports": ["ub", "rdma", "tcp"]
+            }
+        ]
+    })";
+    ASSERT_TRUE(conf->load(policy_json).ok());
+
+    TransportSelector selector(conf);
+    auto transports = makeUbRdmaTcpTransports();
+    auto ctx = makeRemoteCpuSelectionContext();
+
+    EXPECT_EQ(selector.select(ctx, transports, 0).transport, UB);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, RDMA);
+    EXPECT_EQ(selector.select(ctx, transports, 2).transport, TCP);
+}
+
+TEST(UbSelectorTest, SelectorHintUbChoosesUb) {
+    auto conf = std::make_shared<Config>();
+    const std::string policy_json = R"({
+        "policy": [
+            {
+                "name": "hint_ub_memory",
+                "segment_type": "memory",
+                "local_memory": "cpu",
+                "remote_memory": "cpu",
+                "same_machine": false,
+                "transports": ["tcp", "ub"]
+            }
+        ]
+    })";
+    ASSERT_TRUE(conf->load(policy_json).ok());
+
+    TransportSelector selector(conf);
+    auto transports = makeUbTcpTransports();
+    auto ctx = makeRemoteCpuSelectionContext();
+
+    EXPECT_EQ(selector.select(ctx, transports, 0, UB).transport, UB);
+}
+
+TEST(UbSelectorTest, SelectorHintTcpDoesNotUseUb) {
+    auto conf = std::make_shared<Config>();
+    const std::string policy_json = R"({
+        "policy": [
+            {
+                "name": "hint_tcp_memory",
+                "segment_type": "memory",
+                "local_memory": "cpu",
+                "remote_memory": "cpu",
+                "same_machine": false,
+                "transports": ["ub", "tcp"]
+            }
+        ]
+    })";
+    ASSERT_TRUE(conf->load(policy_json).ok());
+
+    TransportSelector selector(conf);
+    auto transports = makeUbTcpTransports();
+    auto ctx = makeRemoteCpuSelectionContext();
+
+    EXPECT_EQ(selector.select(ctx, transports, 0, TCP).transport, TCP);
+}
+
+TEST(UbMetadataAttrsTest, ParseBufferAttrsRequiresTsegAndLocalSegmentIndex) {
+    UbBufferAttrs attrs;
+    auto ok = parseUbBufferAttrs(
+        R"({"version":1,"buffers":{"tseg":["seg0"],"l_seg_index":[7]}})", attrs,
+        "test buffer");
+    ASSERT_TRUE(ok.ok()) << ok.message();
+    ASSERT_EQ(attrs.tseg.size(), 1u);
+    EXPECT_EQ(attrs.tseg[0], "seg0");
+    ASSERT_EQ(attrs.l_seg_index.size(), 1u);
+    EXPECT_EQ(attrs.l_seg_index[0], 7u);
+
+    UbBufferAttrs missing_lseg;
+    auto missing_status =
+        parseUbBufferAttrs(R"({"version":1,"buffers":{"tseg":["seg0"]}})",
+                           missing_lseg, "missing lseg");
+    EXPECT_TRUE(missing_status.IsInvalidArgument());
+
+    UbBufferAttrs mismatch;
+    auto mismatch_status = parseUbBufferAttrs(
+        R"({"version":1,"buffers":{"tseg":["seg0","seg1"],"l_seg_index":[7]}})",
+        mismatch, "mismatch");
+    EXPECT_TRUE(mismatch_status.IsInvalidArgument());
+}
+
+TEST(UbMetadataAttrsTest, ParseDeviceAttrsRequiresEndpointJettyAndDeviceId) {
+    UbDeviceAttrs attrs;
+    auto ok = parseUbDeviceAttrs(
+        R"({"version":1,"eid":"eid0","jetty_num":[11,12],"device_id":3})",
+        attrs, "test device");
+    ASSERT_TRUE(ok.ok()) << ok.message();
+    EXPECT_EQ(attrs.eid, "eid0");
+    EXPECT_EQ(attrs.device_id, 3);
+    ASSERT_EQ(attrs.jetty_num.size(), 2u);
+    EXPECT_EQ(attrs.jetty_num[0], 11u);
+
+    UbDeviceAttrs missing_device_id;
+    auto missing_id =
+        parseUbDeviceAttrs(R"({"version":1,"eid":"eid0","jetty_num":[11]})",
+                           missing_device_id, "missing device id");
+    EXPECT_TRUE(missing_id.IsInvalidArgument());
+
+    UbDeviceAttrs missing_eid;
+    auto missing_eid_status =
+        parseUbDeviceAttrs(R"({"version":1,"jetty_num":[11],"device_id":0})",
+                           missing_eid, "missing eid");
+    EXPECT_TRUE(missing_eid_status.IsInvalidArgument());
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +517,46 @@ TEST(UbTentTransportTest, LargeRequestCreatesMultipleNativeSlices) {
     transport.freeSubBatch(batch);
     free(src_raw);
     free(dst_raw);
+}
+
+TEST(UbTentTransportTest, RemoteMetadataFailureCreatesFailedTrackedSlice) {
+    UbTentTransport transport;
+    std::string seg_name = "test_segment";
+    auto status = transport.install(seg_name, nullptr, nullptr, nullptr);
+    if (!status.ok()) {
+        GTEST_SKIP() << "install failed: " << status.message();
+    }
+
+    const size_t kBufLen = 1024;
+    void* src_raw = alignedAlloc(kBufLen);
+    ASSERT_NE(src_raw, nullptr);
+
+    Transport::SubBatchRef batch = nullptr;
+    ASSERT_TRUE(transport.allocateSubBatch(batch, 1).ok());
+
+    Request req{};
+    req.opcode = Request::WRITE;
+    req.source = src_raw;
+    req.target_id = 12345;
+    req.target_offset = 0;
+    req.length = kBufLen;
+
+    auto submit_status = transport.submitTransferTasks(batch, {req});
+    EXPECT_TRUE(submit_status.IsInvalidArgument()) << submit_status.message();
+
+    auto* ub_batch = dynamic_cast<UbTentTransport::UbSubBatch*>(batch);
+    ASSERT_NE(ub_batch, nullptr);
+    ASSERT_EQ(ub_batch->task_list.size(), 1u);
+    ASSERT_EQ(ub_batch->task_list[0]->slices.size(), 1u);
+    EXPECT_EQ(ub_batch->task_list[0]->slices[0]->status, FAILED);
+
+    TransferStatus ts{};
+    ASSERT_TRUE(transport.getTransferStatus(batch, 0, ts).ok());
+    EXPECT_EQ(ts.s, FAILED);
+    EXPECT_EQ(ts.transferred_bytes, 0u);
+
+    transport.freeSubBatch(batch);
+    free(src_raw);
 }
 
 TEST(UbTentTransportTest, DeviceMaskRestrictsSelectedDevices) {

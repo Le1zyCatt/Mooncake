@@ -25,6 +25,7 @@
 
 #include "tent/runtime/segment_manager.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#include "tent/transport/ub/ub_metadata_attrs.h"
 
 namespace mooncake {
 namespace tent {
@@ -54,105 +55,6 @@ json makeUbBufferAttrs(const std::vector<std::string>& tseg,
                        const std::vector<uint32_t>& l_seg_index) {
     return json{{"version", 1},
                 {"buffers", {{"tseg", tseg}, {"l_seg_index", l_seg_index}}}};
-}
-
-struct UbBufferAttrs {
-    std::vector<std::string> tseg;
-    std::vector<uint32_t> l_seg_index;
-};
-
-struct UbDeviceAttrs {
-    std::string eid;
-    std::vector<uint32_t> jetty_num;
-    int device_id{-1};
-};
-
-Status parseUbBufferAttrs(const std::string& attrs, UbBufferAttrs& out,
-                          const std::string& context) {
-    try {
-        auto j = json::parse(attrs);
-        if (!j.is_object() || j.value("version", 0) != 1 ||
-            !j.contains("buffers") || !j["buffers"].is_object()) {
-            return Status::InvalidArgument(
-                context + ": invalid UB buffer attrs envelope");
-        }
-        const auto& buffers = j["buffers"];
-        if (!buffers.contains("tseg") || !buffers["tseg"].is_array()) {
-            return Status::InvalidArgument(context +
-                                           ": UB buffer attrs missing tseg");
-        }
-        for (const auto& value : buffers["tseg"]) {
-            if (!value.is_string()) {
-                return Status::InvalidArgument(context +
-                                               ": UB tseg entry is not string");
-            }
-            out.tseg.push_back(value.get<std::string>());
-        }
-        if (buffers.contains("l_seg_index")) {
-            if (!buffers["l_seg_index"].is_array()) {
-                return Status::InvalidArgument(
-                    context + ": UB l_seg_index is not an array");
-            }
-            for (const auto& value : buffers["l_seg_index"]) {
-                if (!value.is_number_unsigned()) {
-                    return Status::InvalidArgument(
-                        context + ": UB l_seg_index entry is not uint");
-                }
-                out.l_seg_index.push_back(value.get<uint32_t>());
-            }
-        }
-        if (out.tseg.empty()) {
-            return Status::InvalidArgument(context + ": UB tseg is empty");
-        }
-        if (!out.l_seg_index.empty() &&
-            out.l_seg_index.size() != out.tseg.size()) {
-            return Status::InvalidArgument(
-                context + ": UB tseg/l_seg_index size mismatch");
-        }
-        return Status::OK();
-    } catch (const std::exception& e) {
-        return Status::InvalidArgument(
-            context + ": malformed UB buffer attrs: " + e.what());
-    }
-}
-
-Status parseUbDeviceAttrs(const std::string& attrs, UbDeviceAttrs& out,
-                          const std::string& context) {
-    try {
-        auto j = json::parse(attrs);
-        if (!j.is_object() || j.value("version", 0) != 1) {
-            return Status::InvalidArgument(
-                context + ": invalid UB device attrs envelope");
-        }
-        if (!j.contains("eid") || !j["eid"].is_string()) {
-            return Status::InvalidArgument(context +
-                                           ": UB device attrs missing eid");
-        }
-        out.eid = j["eid"].get<std::string>();
-        if (out.eid.empty()) {
-            return Status::InvalidArgument(context +
-                                           ": UB device eid is empty");
-        }
-        if (!j.contains("jetty_num") || !j["jetty_num"].is_array()) {
-            return Status::InvalidArgument(
-                context + ": UB device attrs missing jetty_num");
-        }
-        for (const auto& value : j["jetty_num"]) {
-            if (!value.is_number_unsigned()) {
-                return Status::InvalidArgument(
-                    context + ": UB jetty_num entry is not uint");
-            }
-            out.jetty_num.push_back(value.get<uint32_t>());
-        }
-        if (out.jetty_num.empty()) {
-            return Status::InvalidArgument(context + ": UB jetty_num is empty");
-        }
-        if (j.contains("device_id")) out.device_id = j["device_id"].get<int>();
-        return Status::OK();
-    } catch (const std::exception& e) {
-        return Status::InvalidArgument(
-            context + ": malformed UB device attrs: " + e.what());
-    }
 }
 
 bool containsTransport(const std::vector<TransportType>& transports,
@@ -251,17 +153,24 @@ Status UbTentTransport::uninstall() {
     accepting_submissions_ = false;
     installed_ = false;
     drainAllInflight();
+    std::vector<uint64_t> registered_addrs;
+    {
+        std::lock_guard<std::mutex> lock(registered_buffers_mutex_);
+        for (const auto& entry : registered_buffers_) {
+            registered_addrs.push_back(entry->addr);
+        }
+        registered_buffers_.clear();
+    }
     if (ub_primitive_) {
+        for (uint64_t addr : registered_addrs) {
+            ub_primitive_->unregisterMemory(reinterpret_cast<void*>(addr));
+        }
         ub_primitive_->uninstall();
         ub_primitive_.reset();
     }
     {
         std::lock_guard<std::mutex> lock(device_mutex_);
         devices_.clear();
-    }
-    {
-        std::lock_guard<std::mutex> lock(registered_buffers_mutex_);
-        registered_buffers_.clear();
     }
     control_service_.reset();
     local_topology_.reset();
@@ -379,7 +288,9 @@ Status UbTentTransport::removeMemoryBuffer(BufferDesc& desc) {
         for (auto it = registered_buffers_.begin();
              it != registered_buffers_.end(); ++it) {
             auto& entry = **it;
-            if (entry.addr != desc.addr) continue;
+            if (entry.addr != desc.addr || entry.length != desc.length) {
+                continue;
+            }
             // Native completions hold an in-flight reference while the
             // low-level URMA Slice may still use the local segment handle.
             // Refuse removal instead of unregistering memory underneath posted
@@ -459,22 +370,26 @@ Status UbTentTransport::chooseDevice(uint64_t device_mask, size_t length,
     std::lock_guard<std::mutex> lock(device_mutex_);
     if (devices_.empty()) return Status::DeviceNotFound("no UB devices");
 
-    double best_score = std::numeric_limits<double>::max();
+    // UB-internal rail selection only. The TENT runtime has already selected
+    // the UB transport; this code only chooses which local UB device may carry
+    // the primitive slice. Keep it deterministic and policy-respecting so it is
+    // easy for the global scheduler to reason about.
+    uint64_t best_projected_inflight = std::numeric_limits<uint64_t>::max();
     int best = -1;
+    uint64_t now = currentTimeNs();
     for (size_t i = 0; i < devices_.size(); ++i) {
         if ((device_mask & (1ULL << i)) == 0) continue;
         auto& dev = devices_[i];
-        uint64_t now = currentTimeNs();
         if (dev->cooldown_until_ns.load(std::memory_order_relaxed) > now) {
             continue;
         }
-        double bw = dev->ewma_bandwidth_bps.load(std::memory_order_relaxed);
-        if (bw <= 0.0) bw = kDefaultUbBandwidthBps;
-        double inflight = static_cast<double>(
-            dev->inflight_bytes.load(std::memory_order_relaxed));
-        double score = (inflight + static_cast<double>(length)) / bw;
-        if (score < best_score) {
-            best_score = score;
+        uint64_t inflight = dev->inflight_bytes.load(std::memory_order_relaxed);
+        uint64_t projected =
+            inflight > std::numeric_limits<uint64_t>::max() - length
+                ? std::numeric_limits<uint64_t>::max()
+                : inflight + length;
+        if (projected < best_projected_inflight) {
+            best_projected_inflight = projected;
             best = static_cast<int>(i);
         }
     }
@@ -484,16 +399,6 @@ Status UbTentTransport::chooseDevice(uint64_t device_mask, size_t length,
     devices_[best]->inflight_bytes.fetch_add(length, std::memory_order_relaxed);
     device_id = best;
     return Status::OK();
-}
-
-void UbTentTransport::releaseDeviceInflight(int device_id, size_t length) {
-    if (device_id < 0) return;
-    std::lock_guard<std::mutex> lock(device_mutex_);
-    if (static_cast<size_t>(device_id) >= devices_.size()) return;
-    auto& inflight = devices_[device_id]->inflight_bytes;
-    auto current = inflight.load(std::memory_order_relaxed);
-    inflight.store(current > length ? current - length : 0,
-                   std::memory_order_relaxed);
 }
 
 Status UbTentTransport::resolveRemoteMetadata(const Request& req,
@@ -559,22 +464,39 @@ Status UbTentTransport::resolveRemoteMetadata(const Request& req,
             return Status::InvalidArgument(
                 "UbTentTransport: segment " + std::to_string(req.target_id) +
                 " buffer " + std::to_string(i) +
-                " UB tseg/device count mismatch" LOC_MARK);
+                " UB tseg/device count mismatch: tseg=" +
+                std::to_string(buffer_attrs.tseg.size()) +
+                " devices=" + std::to_string(mem.devices.size()) + LOC_MARK);
+        }
+        if (buffer_attrs.l_seg_index.size() != mem.devices.size()) {
+            return Status::InvalidArgument(
+                "UbTentTransport: segment " + std::to_string(req.target_id) +
+                " buffer " + std::to_string(i) +
+                " UB l_seg_index/device count mismatch: l_seg_index=" +
+                std::to_string(buffer_attrs.l_seg_index.size()) +
+                " devices=" + std::to_string(mem.devices.size()) + LOC_MARK);
         }
 
         std::optional<size_t> remote_device_index;
         UbDeviceAttrs selected_device_attrs;
+        std::vector<std::string> available_devices;
         for (size_t device_index = 0; device_index < mem.devices.size();
              ++device_index) {
             const auto& dev = mem.devices[device_index];
             auto dit = dev.transport_attrs.find(TransportType::UB);
-            if (dit == dev.transport_attrs.end()) continue;
+            if (dit == dev.transport_attrs.end()) {
+                available_devices.push_back(dev.name + "(no UB attrs)");
+                continue;
+            }
             UbDeviceAttrs device_attrs;
             auto parse_status = parseUbDeviceAttrs(
                 dit->second, device_attrs,
                 "UbTentTransport segment " + std::to_string(req.target_id) +
                     " device " + dev.name);
             if (!parse_status.ok()) return parse_status;
+            available_devices.push_back(dev.name + "(id " +
+                                        std::to_string(device_attrs.device_id) +
+                                        ")");
             if (dev.name == preferred_device_name ||
                 device_attrs.device_id == preferred_device_id) {
                 remote_device_index = device_index;
@@ -588,14 +510,27 @@ Status UbTentTransport::resolveRemoteMetadata(const Request& req,
                 " buffer " + std::to_string(i) +
                 " has no UB device matching local device " +
                 preferred_device_name + " (id " +
-                std::to_string(preferred_device_id) + ")" LOC_MARK);
+                std::to_string(preferred_device_id) +
+                "), available remote "
+                "devices=[" +
+                [&] {
+                    std::ostringstream os;
+                    for (size_t n = 0; n < available_devices.size(); ++n) {
+                        if (n) os << ", ";
+                        os << available_devices[n];
+                    }
+                    return os.str();
+                }() +
+                "]" LOC_MARK);
         }
 
         const auto& dev = mem.devices[*remote_device_index];
         remote.target_buffer_index = i;
-        remote.remote_device_id = static_cast<int>(*remote_device_index);
+        remote.remote_device_id = selected_device_attrs.device_id;
         remote.remote_device_name = dev.name;
         remote.remote_tseg = buffer_attrs.tseg[*remote_device_index];
+        remote.remote_l_seg_index =
+            buffer_attrs.l_seg_index[*remote_device_index];
         remote.peer_nic_path = target->nicPathServerName() + "@" + dev.name;
         remote.remote_eid = std::move(selected_device_attrs.eid);
         remote.remote_jetty_num = std::move(selected_device_attrs.jetty_num);
@@ -641,23 +576,38 @@ void UbTentTransport::releaseLocalSegment(
 Status UbTentTransport::submitRemoteSlice(
     const std::shared_ptr<UbTask>& task,
     const std::shared_ptr<UbSlice>& slice) {
+    auto failUnpostedSlice = [&](const Status& status) {
+        // The device inflight counter is reserved by chooseDevice() before
+        // metadata/local-segment validation. If the primitive slice is never
+        // posted, complete the native slice here so every early-failure path
+        // returns the reservation and leaves task aggregation deterministic.
+        {
+            std::lock_guard<std::mutex> lock(task->mutex);
+            completeSlice(*slice, TransferStatusEnum::FAILED);
+            aggregateTask(*task);
+        }
+        task->cv.notify_all();
+        return status;
+    };
+
     if (!ub_primitive_) {
-        return Status::InternalError(
-            "UbTentTransport: native UB primitive is not installed" LOC_MARK);
+        return failUnpostedSlice(Status::InternalError(
+            "UbTentTransport: native UB primitive is not installed" LOC_MARK));
     }
     if (slice->remote.remote_eid.empty() ||
         slice->remote.remote_jetty_num.empty() ||
         slice->remote.remote_tseg.empty() ||
         slice->remote.peer_nic_path.empty()) {
-        return Status::InvalidArgument(
-            "UbTentTransport: remote UB metadata is incomplete" LOC_MARK);
+        return failUnpostedSlice(Status::InvalidArgument(
+            "UbTentTransport: remote UB metadata is incomplete" LOC_MARK));
     }
 
     uint32_t l_seg_index = 0;
     std::shared_ptr<LocalBufferRegistration> registration;
-    CHECK_STATUS(reserveLocalSegment(
+    auto reserve_status = reserveLocalSegment(
         reinterpret_cast<uint64_t>(slice->source_addr), slice->length,
-        slice->selected_device_id, l_seg_index, registration));
+        slice->selected_device_id, l_seg_index, registration);
+    if (!reserve_status.ok()) return failUnpostedSlice(reserve_status);
 
     {
         std::lock_guard<std::mutex> lock(task->mutex);
@@ -684,6 +634,10 @@ Status UbTentTransport::submitRemoteSlice(
     desc.retry_cnt = 0;
     desc.max_retry_cnt =
         conf_ ? conf_->get<uint32_t>("transports/ub/retry_count", 3) : 3;
+    // The primitive owns the low-level posted work asynchronously. Capture
+    // shared task/slice state so freeSubBatch() can drain safely and the
+    // completion callback cannot reference a vector element or stack frame that
+    // has already gone away.
     desc.completion = [this, task, slice, registration](bool success,
                                                         size_t bytes) {
         finishRemoteSlice(task, slice, registration,

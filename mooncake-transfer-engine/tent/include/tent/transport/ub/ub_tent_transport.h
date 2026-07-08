@@ -55,6 +55,7 @@ class UbTentTransport : public Transport {
         std::vector<uint32_t> remote_jetty_num;
         int remote_device_id{-1};
         std::string remote_device_name;
+        uint32_t remote_l_seg_index{0};
         size_t target_buffer_index{0};
     };
 
@@ -152,7 +153,6 @@ class UbTentTransport : public Transport {
         const std::shared_ptr<LocalBufferRegistration>& registration);
     Status chooseDevice(uint64_t device_mask, size_t length, int priority,
                         int& device_id);
-    void releaseDeviceInflight(int device_id, size_t length);
     Status submitRemoteSlice(const std::shared_ptr<UbTask>& task,
                              const std::shared_ptr<UbSlice>& slice);
     void finishRemoteSlice(

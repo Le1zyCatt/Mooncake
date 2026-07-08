@@ -10,22 +10,25 @@ responsibility.
 
 ## 1. Scope
 
-Compared with `main`, this branch adds TENT-side support for UB transport and
-wraps the existing Kunpeng URMA primitives behind a narrow native primitive
-layer.
+`UB_TENT` was the compatibility milestone: it made UB visible to TENT, but the
+data path still adapted a TENT request into classic TE `TransferTask` work.
 
-| Area                     | `main`                                     | `UB_TENT`                                                          |
-| ------------------------ | ------------------------------------------ | ------------------------------------------------------------------ |
-| TENT transport enum      | No `UB` transport type                     | Adds `TransportType::UB`                                           |
-| Transport selector       | Cannot parse or select `"ub"`              | Supports `"ub"` as a transport policy entry                        |
-| Transport loader         | Cannot instantiate UB in TENT              | Creates `UbTentTransport` when UB is enabled                       |
-| TENT UB backend          | Not available                              | Adds `UbTentTransport`                                             |
-| Primitive layer          | Old UB owns task/batch execution           | Adds `UbNativePrimitive` wrapper for URMA register/post/poll       |
-| UB bootstrap             | Old UB handshake path only                 | Native path consumes TENT UB device attrs for endpoint setup       |
-| Local segment publishing | No UB-specific TENT attrs                  | Publishes UB EID and tseg data through TENT transport attrs        |
-| Submit fallback          | Submit failure may not be retried cleanly  | Reports native UB task failure to TENT for runtime-level failover  |
-| URMA registration        | Multiple contexts may register the same VA | Primary context registers once; other contexts adopt the segment   |
-| Tests                    | No TENT UB tests                           | Adds `tent_ub_transport_test` and `tent_ub_e2e_dual_node_test`     |
+`ub-tent-native-migration-plan` is the native migration branch: TENT selects UB,
+then `UbTentTransport` builds native UB tasks/slices, parses TENT UB metadata
+directly, and submits primitive UB work through `UbNativePrimitive`.
+
+| Area                     | `UB_TENT` compatibility path                         | `ub-tent-native-migration-plan`                                  |
+| ------------------------ | ---------------------------------------------------- | ----------------------------------------------------------------- |
+| TENT transport enum      | Adds `TransportType::UB`                             | Keeps `TransportType::UB`                                         |
+| Transport selector       | Supports `"ub"` as a policy entry                    | Keeps policy/priority/hint selection in TENT runtime              |
+| Transport loader         | Creates `UbTentTransport` when UB is enabled         | Creates the same backend, now with native UB execution            |
+| TENT UB backend          | Adapter over classic TE UB task/batch execution      | Native `UbTask`/`UbSlice` execution owned by `UbTentTransport`    |
+| Primitive layer          | Classic UB owns request slicing and submit           | `UbNativePrimitive` wraps URMA register/endpoint/post/poll only   |
+| UB bootstrap             | Uses the old UB metadata bridge                      | Consumes TENT UB device attrs for endpoint setup                  |
+| Local segment publishing | Publishes UB attrs for adapter compatibility         | Publishes UB EID, jetty, tseg, and l_seg_index through TENT attrs |
+| Submit fallback          | Adapter submit failures are reported at batch level  | Native slice/task failures are surfaced for runtime failover      |
+| URMA registration        | Classic UB owns registration lifetime                | TENT UB backend tracks registration refcount and in-flight use    |
+| Tests                    | Basic UB enablement checks                           | Native selector, metadata, chunking, mask, and status tests       |
 
 Main files to review:
 
@@ -126,15 +129,27 @@ GLOG_logtostderr=1 \
 | `UbSelectorTest.UbEnumValue`                      | Verifies that the UB enum value is inside the supported transport range                  |
 | `UbSelectorTest.SelectorPolicyForceUbWithTcpAlsoEnabled` | Verifies that policy `transports=["ub"]` selects UB even when TCP is enabled      |
 | `UbSelectorTest.SelectorPolicyForceTcpDoesNotUseUb`      | Verifies that policy `transports=["tcp"]` does not use UB                         |
+| `UbSelectorTest.SelectorPolicyUbRdmaTcpPriority`         | Verifies UB/RDMA/TCP policy order and failover index behavior                     |
+| `UbSelectorTest.SelectorHintUbChoosesUb`                 | Verifies per-request `transport_hint=ub` can select UB                            |
+| `UbSelectorTest.SelectorHintTcpDoesNotUseUb`             | Verifies `transport_hint=tcp` does not accidentally route to UB                   |
+| `UbMetadataAttrsTest.ParseBufferAttrsRequiresTsegAndLocalSegmentIndex` | Verifies strict UB buffer attr parsing                         |
+| `UbMetadataAttrsTest.ParseDeviceAttrsRequiresEndpointJettyAndDeviceId` | Verifies strict UB device attr parsing                         |
 | `UbTentTransportTest.InstallWithMockUrma`         | Verifies basic install lifecycle with mock URMA and checks the transport name/capability |
 | `UbTentTransportTest.AddAndRemoveMemoryBuffer`    | Verifies page-aligned memory add/remove flow and updates to `desc.transports`            |
+| `UbTentTransportTest.RepeatedRegisterUnregisterSameVA` | Verifies duplicate registration refcount behavior                                      |
 | `UbTentTransportTest.AllocateAndFreeSubBatch`     | Verifies native sub-batch allocation and release                                         |
 | `UbTentTransportTest.SubmitAndPollMockTransfer`   | Verifies local native chunk status aggregation                                           |
+| `UbTentTransportTest.LargeRequestCreatesMultipleNativeSlices` | Verifies UB-internal chunking for large requests                               |
+| `UbTentTransportTest.RemoteMetadataFailureCreatesFailedTrackedSlice` | Verifies metadata failure produces a tracked failed slice                    |
+| `UbTentTransportTest.DeviceMaskRestrictsSelectedDevices` | Verifies selector device mask is respected by UB device selection                    |
+| `UbTentTransportTest.PartialSliceFailureAggregatesTaskFailed` | Verifies any failed native slice fails the logical task                         |
 | `UbTentTransportTest.DoubleUninstallSafe`         | Verifies that repeated uninstall is safe                                                 |
 
 The unit test mainly covers selector mapping, native backend lifecycle, memory buffer lifecycle, sub-batch lifecycle, and mock transfer smoke behavior.
 
-It does not prove that the real UB data plane completes on hardware. It also does not fully assert the serialized `transport_attrs[UB]` content. That deeper validation belongs to the dual-node integration test and hardware inspection.
+It does not prove that the real UB data plane completes on hardware. It also
+does not fully simulate a long-running asynchronous remote UB post; that deeper
+validation belongs to the dual-node integration test and hardware inspection.
 
 On a host where real `liburma.so` is present but no usable UB HCA exists, hardware-dependent setup may fail and the corresponding test path may skip. That is expected for local developer machines without Kunpeng UB hardware.
 
