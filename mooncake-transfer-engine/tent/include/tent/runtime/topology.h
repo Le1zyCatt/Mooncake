@@ -38,15 +38,37 @@ class Topology {
    public:
     const static size_t DevicePriorityRanks = 3;
 
-    enum NicType { NIC_RDMA, NIC_TCP, NIC_UNKNOWN };
+    // Keep the existing RDMA/TCP numeric values stable for serialized
+    // topologies. UB is a distinct link type and must never be selected as an
+    // RDMA verbs device.
+    enum NicType {
+        NIC_RDMA = 0,
+        NIC_TCP = 1,
+        NIC_UNKNOWN = 2,
+        NIC_UB = 3,
+    };
     enum MemType { MEM_HOST, MEM_CUDA, MEM_ROCM, MEM_ASCEND, MEM_UNKNOWN };
 
     using NicID = int;
     struct NicEntry {
         std::string name;
         std::string pci_bus_id;
-        NicType type;
-        int numa_node;
+        NicType type{NIC_UNKNOWN};
+        int numa_node{-1};
+
+        // Keep new fields after the original four members so existing
+        // positional aggregate initializers remain source compatible.
+        // Native driver name. For RDMA/TCP this normally equals `name`; UB
+        // discovery may make `name` unique per EID while retaining the shared
+        // underlying device name here.
+        std::string native_name;
+        // Native discovery identity. A single UB device may expose several
+        // EIDs, so topology identity is (device_index, eid_index), not merely
+        // the device name.
+        int device_index{-1};
+        int eid_index{-1};
+        std::string eid;
+        bool active{true};
     };
 
     using MemID = int;
@@ -67,7 +89,11 @@ class Topology {
 
     void clear();
 
+    // Preserve the original one-argument symbol for source and binary
+    // compatibility with callers that do not opt into UB discovery.
     Status discover(const std::vector<Platform*>& platforms);
+
+    Status discover(const std::vector<Platform*>& platforms, bool discover_ub);
 
     Status parse(const std::string& json_content);
 

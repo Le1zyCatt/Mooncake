@@ -1,0 +1,85 @@
+// Copyright 2026 KVCache.AI
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TENT_TRANSPORT_UB_CONTEXT_H_
+#define TENT_TRANSPORT_UB_CONTEXT_H_
+
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <vector>
+
+#include "tent/common/status.h"
+#include "tent/runtime/topology.h"
+#include "tent/transport/ub/jfc.h"
+#include "tent/transport/ub/urma_adapter.h"
+
+namespace mooncake::tent::ub {
+
+class UbContext final : public std::enable_shared_from_this<UbContext> {
+   public:
+    enum class State : uint8_t {
+        kUninitialized,
+        kActive,
+        kFailed,
+        kDraining,
+        kClosed,
+    };
+
+    UbContext(Topology::NicID topology_id, DeviceInfo device,
+              std::shared_ptr<UrmaAdapter> adapter);
+    ~UbContext();
+
+    UbContext(const UbContext&) = delete;
+    UbContext& operator=(const UbContext&) = delete;
+
+    Status initialize(uint32_t jfc_count, const JfcOptions& options);
+    Status shutdown();
+    void markUnavailable() noexcept;
+
+    [[nodiscard]] Topology::NicID topologyId() const noexcept {
+        return topology_id_;
+    }
+    [[nodiscard]] const DeviceInfo& deviceInfo() const noexcept {
+        return device_;
+    }
+    [[nodiscard]] const ContextPtr& handle() const noexcept { return handle_; }
+    [[nodiscard]] State state() const noexcept {
+        return state_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] bool active() const noexcept {
+        return state() == State::kActive;
+    }
+    [[nodiscard]] const std::vector<std::shared_ptr<UbJfc>>& jfcs() const {
+        return jfcs_;
+    }
+    [[nodiscard]] std::shared_ptr<UbJfc> jfc(size_t index) const;
+
+    void addInflight(uint64_t bytes) noexcept;
+    void removeInflight(uint64_t bytes) noexcept;
+    [[nodiscard]] uint64_t inflightBytes() const noexcept {
+        return inflight_bytes_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t outstandingWrs() const noexcept {
+        return outstanding_wrs_.load(std::memory_order_relaxed);
+    }
+
+   private:
+    const Topology::NicID topology_id_;
+    const DeviceInfo device_;
+    std::shared_ptr<UrmaAdapter> adapter_;
+    ContextPtr handle_;
+    std::vector<std::shared_ptr<UbJfc>> jfcs_;
+    mutable std::mutex lifecycle_mutex_;
+    std::atomic<State> state_{State::kUninitialized};
+    std::atomic<uint64_t> inflight_bytes_{0};
+    std::atomic<uint64_t> outstanding_wrs_{0};
+};
+
+using UbContextPtr = std::shared_ptr<UbContext>;
+
+}  // namespace mooncake::tent::ub
+
+#endif  // TENT_TRANSPORT_UB_CONTEXT_H_

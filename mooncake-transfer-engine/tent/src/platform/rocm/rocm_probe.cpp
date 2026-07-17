@@ -65,10 +65,11 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
         std::ifstream(path) >> numa_node;
 
         devices.push_back(
-            Topology::NicEntry{.name = std::move(device_name),
+            Topology::NicEntry{.name = device_name,
                                .pci_bus_id = std::move(pci_bus_id),
                                .type = Topology::NIC_RDMA,
-                               .numa_node = numa_node});
+                               .numa_node = numa_node,
+                               .native_name = device_name});
     }
     ibv_free_device_list(device_list);
     return devices;
