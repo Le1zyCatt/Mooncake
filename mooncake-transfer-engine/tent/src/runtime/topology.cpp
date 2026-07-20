@@ -17,16 +17,21 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <filesystem>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "tent/common/status.h"
 #include "tent/runtime/platform.h"
 #include "tent/common/utils/random.h"
 #include "tent/thirdparty/nlohmann/json.h"
+#ifdef USE_UB
+#include "tent/transport/ub/urma_adapter.h"
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -47,9 +52,14 @@ std::string Topology::toString() const {
     for (const auto& nic : nic_list_) {
         nlohmann::json nj;
         nj["name"] = nic.name;
+        nj["native_name"] = nic.native_name;
         nj["pci_bus_id"] = nic.pci_bus_id;
         nj["type"] = nic.type;
         nj["numa_node"] = nic.numa_node;
+        nj["device_index"] = nic.device_index;
+        nj["eid_index"] = nic.eid_index;
+        nj["eid"] = nic.eid;
+        nj["active"] = nic.active;
         j["nics"].push_back(nj);
     }
 
@@ -99,10 +109,84 @@ void Topology::print() const {
 }
 
 Status Topology::discover(const std::vector<Platform*>& platforms) {
+    return discover(platforms, false);
+}
+
+Status Topology::discover(const std::vector<Platform*>& platforms,
+                          bool discover_ub) {
     clear();
     for (auto& entry : platforms) {
         CHECK_STATUS(entry->probe(nic_list_, mem_list_));
     }
+#ifdef USE_UB
+    // UB discovery is intentionally adapter-backed instead of inferring UB
+    // devices from verbs/sysfs names. One topology NIC is emitted per EID and
+    // carries both the globally serialized identity and the native URMA name.
+    auto adapter = discover_ub ? ub::createDefaultUrmaAdapter() : nullptr;
+    if (adapter && adapter->available()) {
+        auto status = adapter->initialize();
+        if (status.ok()) {
+            std::vector<ub::DeviceInfo> devices;
+            status = adapter->discoverDevices(devices);
+            if (status.ok()) {
+                std::unordered_map<std::string, int> native_device_indices;
+                for (const auto& device : devices) {
+                    auto [native_it, inserted] = native_device_indices.emplace(
+                        device.native_device_name,
+                        static_cast<int>(native_device_indices.size()));
+                    (void)inserted;
+
+                    int numa_node = -1;
+                    std::string pci_bus_id;
+                    if (!device.native_device_path.empty()) {
+                        std::error_code error;
+                        const auto device_path = std::filesystem::canonical(
+                            std::filesystem::path(device.native_device_path) /
+                                "device",
+                            error);
+                        if (!error) {
+                            pci_bus_id = device_path.filename().string();
+                            std::ifstream(device_path / "numa_node") >>
+                                numa_node;
+                        }
+                    }
+
+                    const NicID nic_id = static_cast<NicID>(nic_list_.size());
+                    nic_list_.push_back(NicEntry{
+                        .name = device.topology_name,
+                        .pci_bus_id = std::move(pci_bus_id),
+                        .type = NIC_UB,
+                        .numa_node = numa_node,
+                        .native_name = device.native_device_name,
+                        .device_index = native_it->second,
+                        .eid_index = static_cast<int>(device.eid_index),
+                        .eid = device.eid,
+                        .active = device.active});
+
+                    for (auto& memory : mem_list_) {
+                        const size_t rank =
+                            numa_node >= 0 && memory.numa_node == numa_node
+                                ? 0
+                                : DevicePriorityRanks - 1;
+                        memory.device_list[rank].push_back(nic_id);
+                    }
+                }
+            } else {
+                LOG(WARNING) << "Unable to discover optional UB devices: "
+                             << status.ToString();
+            }
+            auto shutdown_status = adapter->shutdown();
+            if (!shutdown_status.ok()) {
+                LOG(WARNING) << "Unable to release UB discovery runtime: "
+                             << shutdown_status.ToString();
+            }
+        } else {
+            LOG(WARNING) << "Unable to initialize optional UB discovery: "
+                         << status.ToString();
+        }
+    }
+#endif
+    (void)discover_ub;
     return Status::OK();
 }
 
@@ -114,10 +198,15 @@ Status Topology::parse(const std::string& json_content) {
             for (auto& item : j["nics"]) {
                 NicEntry nic;
                 nic.name = item.value("name", "");
+                nic.native_name = item.value("native_name", nic.name);
                 nic.pci_bus_id = item.value("pci_bus_id", "");
                 nic.type =
                     static_cast<NicType>(item.value("type", NIC_UNKNOWN));
                 nic.numa_node = item.value("numa_node", -1);
+                nic.device_index = item.value("device_index", -1);
+                nic.eid_index = item.value("eid_index", -1);
+                nic.eid = item.value("eid", "");
+                nic.active = item.value("active", true);
                 nic_list_.push_back(nic);
             }
         }
