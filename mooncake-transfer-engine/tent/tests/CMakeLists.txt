@@ -209,6 +209,23 @@ target_include_directories(tent_transport_selector_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
 
+add_executable(tent_ub_core_test ub_core_test.cpp ../src/transport/ub/quota.cpp
+                                 ../src/transport/ub/rail_monitor.cpp)
+target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
+target_include_directories(tent_ub_core_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
+
+if(USE_UB)
+  add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
+  target_link_libraries(tent_ub_native_data_path_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+  target_include_directories(tent_ub_native_data_path_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_native_data_path_test
+           COMMAND tent_ub_native_data_path_test)
+endif()
+
 # End-to-end failover test: drives real TransferEngineImpl with
 # FaultProxyTransport-wrapped fakes to exercise resubmitTransferTask.
 add_executable(tent_engine_failover_e2e_test engine_failover_e2e_test.cpp)
