@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <ranges>
@@ -4097,6 +4098,284 @@ TEST_F(StorageBackendTest,
         }
         EXPECT_TRUE(any_gone) << "Evicted keys must be removed from shard.map";
     }
+}
+
+// -----------------------------------------------------------------------------
+// BucketStorageBackend explicit-delete and tombstone-GC tests
+// -----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketTombstoneIsDurableAndHiddenAfterRestart) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+
+    const std::string key = MakeTenantScopedStorageKey("tenant-a", "removed");
+    const std::string value = "durable tombstone payload";
+    StorageObjectMetadata stored;
+
+    {
+        BucketStorageBackend backend(config, bucket_config);
+        ASSERT_TRUE(backend.Init().has_value());
+        std::vector<std::unique_ptr<char[]>> buffers;
+        auto batch = MakeSingleKeyBatch(key, value, buffers);
+        auto offload = backend.BatchOffload(
+            batch, [&](const std::vector<std::string>& keys,
+                       std::vector<StorageObjectMetadata>& metadatas) {
+                EXPECT_EQ(keys, std::vector<std::string>{key});
+                EXPECT_EQ(metadatas.size(), 1u);
+                if (!metadatas.empty()) stored = metadatas.front();
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(offload.has_value());
+
+        RemoveTaskItem task{.task_id = 7,
+                            .tenant_id = "tenant-a",
+                            .key = key,
+                            .object_version = stored.object_version,
+                            .data_size = stored.data_size};
+        auto removed = backend.MarkRemoved(task);
+        ASSERT_TRUE(removed.has_value());
+        EXPECT_EQ(removed.value(), MarkRemovedResult::kRemoved);
+        EXPECT_FALSE(backend.IsExist(key).value_or(true));
+
+        std::vector<char> output(value.size());
+        std::unordered_map<std::string, Slice> load;
+        load.emplace(key, Slice{output.data(), output.size()});
+        EXPECT_FALSE(backend.BatchLoad(load).has_value());
+
+        auto duplicate = backend.MarkRemoved(task);
+        ASSERT_TRUE(duplicate.has_value());
+        EXPECT_EQ(duplicate.value(), MarkRemovedResult::kAlreadyRemoved);
+        EXPECT_GT(backend.GetTombstonedBytes(), 0);
+    }
+
+    BucketStorageBackend restarted(config, bucket_config);
+    ASSERT_TRUE(restarted.Init().has_value());
+    EXPECT_FALSE(restarted.IsExist(key).value_or(true));
+    EXPECT_GT(restarted.GetTombstonedBytes(), 0);
+
+    std::vector<std::string> scanned;
+    auto scan = restarted.ScanMeta([&](const std::vector<std::string>& keys,
+                                       std::vector<StorageObjectMetadata>&) {
+        scanned.insert(scanned.end(), keys.begin(), keys.end());
+        return ErrorCode::OK;
+    });
+    ASSERT_TRUE(scan.has_value());
+    EXPECT_TRUE(scanned.empty());
+}
+
+TEST_F(StorageBackendTest, OldDeleteTaskCannotRemoveRecreatedKey) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    const std::string key = MakeTenantScopedStorageKey("tenant-a", "same-key");
+    StorageObjectMetadata old_metadata;
+    std::vector<std::unique_ptr<char[]>> buffers;
+    auto old_batch = MakeSingleKeyBatch(key, "old-value", buffers);
+    ASSERT_TRUE(
+        backend
+            .BatchOffload(old_batch,
+                          [&](const std::vector<std::string>&,
+                              std::vector<StorageObjectMetadata>& metadatas) {
+                              old_metadata = metadatas.front();
+                              return ErrorCode::OK;
+                          })
+            .has_value());
+
+    RemoveTaskItem old_task{.task_id = 11,
+                            .tenant_id = "tenant-a",
+                            .key = key,
+                            .object_version = old_metadata.object_version,
+                            .data_size = old_metadata.data_size};
+    ASSERT_EQ(backend.MarkRemoved(old_task).value(),
+              MarkRemovedResult::kRemoved);
+
+    StorageObjectMetadata new_metadata;
+    const std::string new_value = "new-value-survives";
+    auto new_batch = MakeSingleKeyBatch(key, new_value, buffers);
+    ASSERT_TRUE(
+        backend
+            .BatchOffload(new_batch,
+                          [&](const std::vector<std::string>&,
+                              std::vector<StorageObjectMetadata>& metadatas) {
+                              new_metadata = metadatas.front();
+                              return ErrorCode::OK;
+                          })
+            .has_value());
+    ASSERT_NE(old_metadata.object_version, new_metadata.object_version);
+
+    auto stale = backend.MarkRemoved(old_task);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_EQ(stale.value(), MarkRemovedResult::kStaleVersion);
+    EXPECT_TRUE(backend.IsExist(key).value_or(false));
+
+    std::vector<char> output(new_value.size());
+    std::unordered_map<std::string, Slice> load;
+    load.emplace(key, Slice{output.data(), output.size()});
+    ASSERT_TRUE(backend.BatchLoad(load).has_value());
+    EXPECT_EQ(std::string(output.begin(), output.end()), new_value);
+}
+
+TEST_F(StorageBackendTest, BucketGcCopiesOnlyLiveObjectsAndDeletesOldBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    const std::string removed_key = "removed-key";
+    const std::string live_key = "live-key";
+    const std::string removed_value(4096, 'R');
+    const std::string live_value(4096, 'L');
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(removed_key, std::vector<Slice>{Slice{
+                                   const_cast<char*>(removed_value.data()),
+                                   removed_value.size()}});
+    batch.emplace(live_key,
+                  std::vector<Slice>{Slice{const_cast<char*>(live_value.data()),
+                                           live_value.size()}});
+
+    std::unordered_map<std::string, StorageObjectMetadata> metadata_by_key;
+    auto offload = backend.BatchOffload(
+        batch, [&](const std::vector<std::string>& keys,
+                   std::vector<StorageObjectMetadata>& metadatas) {
+            for (size_t i = 0; i < keys.size(); ++i) {
+                metadata_by_key[keys[i]] = metadatas[i];
+            }
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(offload.has_value());
+    const int64_t old_bucket_id = offload.value();
+    const auto old_data_path =
+        fs::path(data_path) / (std::to_string(old_bucket_id) + ".bucket");
+    const auto old_meta_path =
+        fs::path(data_path) / (std::to_string(old_bucket_id) + ".meta");
+
+    const auto& removed_meta = metadata_by_key.at(removed_key);
+    RemoveTaskItem task{.task_id = 13,
+                        .key = removed_key,
+                        .object_version = removed_meta.object_version,
+                        .data_size = removed_meta.data_size};
+    ASSERT_EQ(backend.MarkRemoved(task).value(), MarkRemovedResult::kRemoved);
+
+    auto gc = backend.RunTombstoneGC(1);
+    ASSERT_TRUE(gc.has_value());
+    EXPECT_EQ(gc->buckets_compacted, 1u);
+    EXPECT_GT(gc->physical_bytes_reclaimed, 0);
+    EXPECT_FALSE(fs::exists(old_data_path));
+    EXPECT_FALSE(fs::exists(old_meta_path));
+    EXPECT_FALSE(backend.IsExist(removed_key).value_or(true));
+    EXPECT_TRUE(backend.IsExist(live_key).value_or(false));
+    EXPECT_EQ(backend.GetTombstonedBytes(), 0);
+
+    std::vector<char> output(live_value.size());
+    std::unordered_map<std::string, Slice> load;
+    load.emplace(live_key, Slice{output.data(), output.size()});
+    ASSERT_TRUE(backend.BatchLoad(load).has_value());
+    EXPECT_EQ(std::string(output.begin(), output.end()), live_value);
+}
+
+TEST_F(StorageBackendTest, BucketGcDeletesFullyTombstonedBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    const std::string key = "only-key";
+    StorageObjectMetadata metadata;
+    std::vector<std::unique_ptr<char[]>> buffers;
+    auto batch = MakeSingleKeyBatch(key, std::string(4096, 'X'), buffers);
+    auto offload = backend.BatchOffload(
+        batch, [&](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>& metadatas) {
+            metadata = metadatas.front();
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(offload.has_value());
+    const int64_t bucket_id = offload.value();
+
+    RemoveTaskItem task{.task_id = 17,
+                        .key = key,
+                        .object_version = metadata.object_version,
+                        .data_size = metadata.data_size};
+    ASSERT_EQ(backend.MarkRemoved(task).value(), MarkRemovedResult::kRemoved);
+    auto gc = backend.RunTombstoneGC(1);
+    ASSERT_TRUE(gc.has_value());
+    EXPECT_EQ(gc->buckets_compacted, 1u);
+    EXPECT_GT(gc->physical_bytes_reclaimed, 0);
+    EXPECT_FALSE(fs::exists(fs::path(data_path) /
+                            (std::to_string(bucket_id) + ".bucket")));
+    EXPECT_FALSE(fs::exists(fs::path(data_path) /
+                            (std::to_string(bucket_id) + ".meta")));
+    EXPECT_EQ(backend.GetTombstonedBytes(), 0);
+}
+
+TEST_F(StorageBackendTest, FailedTombstonePersistenceKeepsObjectVisible) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend backend(config, bucket_config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    const std::string key = "persist-failure-key";
+    StorageObjectMetadata metadata;
+    std::vector<std::unique_ptr<char[]>> buffers;
+    auto batch = MakeSingleKeyBatch(key, "value", buffers);
+    auto offload = backend.BatchOffload(
+        batch, [&](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>& metadatas) {
+            metadata = metadatas.front();
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(offload.has_value());
+
+    const auto meta_path =
+        fs::path(data_path) / (std::to_string(offload.value()) + ".meta");
+    const auto backup_path = meta_path.string() + ".backup";
+    fs::rename(meta_path, backup_path);
+    ASSERT_TRUE(fs::exists(backup_path));
+    ASSERT_TRUE(fs::create_directory(meta_path));
+    {
+        std::ofstream blocker(meta_path / "blocker");
+        ASSERT_TRUE(blocker.is_open());
+        blocker << "prevent atomic rename";
+    }
+
+    RemoveTaskItem task{.task_id = 19,
+                        .key = key,
+                        .object_version = metadata.object_version,
+                        .data_size = metadata.data_size};
+    auto failed = backend.MarkRemoved(task);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_TRUE(backend.IsExist(key).value_or(false));
+    EXPECT_EQ(backend.GetTombstonedBytes(), 0);
+
+    fs::remove_all(meta_path);
+    fs::rename(backup_path, meta_path);
+}
+
+TEST_F(StorageBackendTest, InitCleansUncommittedCompactionFiles) {
+    const auto orphan_bucket = fs::path(data_path) / "424242.bucket";
+    const auto staged_metadata = fs::path(data_path) / "424242.meta.tmp.123.1";
+    {
+        std::ofstream data(orphan_bucket);
+        data << "uncommitted data";
+        std::ofstream metadata(staged_metadata);
+        metadata << "uncommitted metadata";
+    }
+    ASSERT_TRUE(fs::exists(orphan_bucket));
+    ASSERT_TRUE(fs::exists(staged_metadata));
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init().has_value());
+    EXPECT_FALSE(fs::exists(orphan_bucket));
+    EXPECT_FALSE(fs::exists(staged_metadata));
 }
 
 }  // namespace mooncake::test

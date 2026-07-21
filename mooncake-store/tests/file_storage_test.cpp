@@ -1,8 +1,10 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <thread>
 
@@ -14,6 +16,34 @@
 #include "utils/common.h"
 
 namespace mooncake {
+
+class RemoveFakeClient : public Client {
+   public:
+    RemoveFakeClient()
+        : Client(/*local_hostname=*/"localhost:9003",
+                 /*metadata_connstring=*/"",
+                 /*protocol=*/"tcp",
+                 /*labels=*/{}) {}
+
+    std::vector<RemoveTaskItem> remove_tasks;
+    std::vector<std::vector<uint64_t>> ack_batches;
+
+    tl::expected<void, ErrorCode> FetchRemoveTasks(
+        uint32_t max_tasks,
+        std::vector<RemoveTaskItem>& fetched_tasks) override {
+        fetched_tasks.clear();
+        const size_t count = std::min<size_t>(max_tasks, remove_tasks.size());
+        fetched_tasks.insert(fetched_tasks.end(), remove_tasks.begin(),
+                             remove_tasks.begin() + count);
+        return {};
+    }
+
+    tl::expected<void, ErrorCode> AckRemoveTasks(
+        const std::vector<uint64_t>& task_ids) override {
+        ack_batches.push_back(task_ids);
+        return {};
+    }
+};
 
 void SetEnv(const std::string& key, const std::string& value) {
     setenv(key.c_str(), value.c_str(), 1);
@@ -84,6 +114,16 @@ class FileStorageTest : public ::testing::Test {
         FileStorage& fileStorage,
         const std::vector<std::string>& evicted_keys) {
         return fileStorage.NotifyEvictedDiskReplicas(evicted_keys);
+    }
+
+    tl::expected<void, ErrorCode> FileStorageProcessRemoveTasks(
+        FileStorage& fileStorage) {
+        return fileStorage.ProcessRemoveTasks();
+    }
+
+    std::shared_ptr<StorageBackendInterface> FileStorageBackend(
+        FileStorage& fileStorage) {
+        return fileStorage.storage_backend_;
     }
 
     tl::expected<void, ErrorCode> FileStorageGroupOffloadingKeysByBucket(
@@ -767,6 +807,73 @@ TEST_F(FileStorageTest, NullSsdMetricDoesNotCrash) {
         FileStorageBatchLoad(fileStorage, allocate_res.value()->slices);
     ASSERT_TRUE(load_result);
     // No crash = success. No metrics pointer, so nothing to verify.
+}
+
+TEST_F(FileStorageTest, RemoveTaskIsAckedOnlyAfterDurableTombstone) {
+    auto fake = std::make_shared<RemoveFakeClient>();
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kBucket;
+    config.storage_filepath = data_path;
+    FileStorage file_storage(config, fake, "localhost:9003");
+    auto backend = FileStorageBackend(file_storage);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    const std::string tenant = "tenant-a";
+    const std::string user_key = "ack-after-fsync";
+    const std::string storage_key =
+        MakeTenantScopedStorageKey(tenant, user_key);
+    const std::string value = "value";
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(storage_key,
+                  std::vector<Slice>{
+                      Slice{const_cast<char*>(value.data()), value.size()}});
+    StorageObjectMetadata metadata;
+    auto offload = backend->BatchOffload(
+        batch, [&](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>& metadatas) {
+            metadata = metadatas.front();
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(offload.has_value());
+
+    fake->remove_tasks.push_back(
+        RemoveTaskItem{.task_id = 101,
+                       .tenant_id = tenant,
+                       .key = user_key,
+                       .object_version = metadata.object_version,
+                       .data_size = metadata.data_size});
+
+    const auto meta_path =
+        fs::path(data_path) / (std::to_string(offload.value()) + ".meta");
+    const auto backup_path = meta_path.string() + ".backup";
+    fs::rename(meta_path, backup_path);
+    ASSERT_TRUE(fs::create_directory(meta_path));
+    {
+        std::ofstream blocker(meta_path / "blocker");
+        ASSERT_TRUE(blocker.is_open());
+        blocker << "prevent atomic metadata publish";
+    }
+
+    auto failed_tick = FileStorageProcessRemoveTasks(file_storage);
+    ASSERT_TRUE(failed_tick.has_value());
+    EXPECT_TRUE(fake->ack_batches.empty());
+    EXPECT_TRUE(backend->IsExist(storage_key).value_or(false));
+
+    fs::remove_all(meta_path);
+    fs::rename(backup_path, meta_path);
+
+    auto successful_tick = FileStorageProcessRemoveTasks(file_storage);
+    ASSERT_TRUE(successful_tick.has_value());
+    ASSERT_EQ(fake->ack_batches.size(), 1u);
+    EXPECT_EQ(fake->ack_batches.front(), std::vector<uint64_t>{101});
+    EXPECT_FALSE(backend->IsExist(storage_key).value_or(true));
+
+    // Simulate an ACK response loss: Master redelivers the same task. The
+    // missing local incarnation is terminal and safe to ACK again.
+    auto retry_tick = FileStorageProcessRemoveTasks(file_storage);
+    ASSERT_TRUE(retry_tick.has_value());
+    ASSERT_EQ(fake->ack_batches.size(), 2u);
+    EXPECT_EQ(fake->ack_batches.back(), std::vector<uint64_t>{101});
 }
 
 }  // namespace mooncake

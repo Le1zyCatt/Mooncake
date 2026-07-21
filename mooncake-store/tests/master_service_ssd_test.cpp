@@ -3,6 +3,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -54,22 +57,34 @@ void MountMemoryAndLocalDisk(MasterService& service, const UUID& client_id,
 
 void PutAndOffload(MasterService& service, const UUID& client_id,
                    const std::string& key, int64_t object_size,
-                   const std::string& local_disk_endpoint) {
+                   const std::string& local_disk_endpoint,
+                   const std::string& tenant_id = "default") {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    ASSERT_TRUE(service.PutStart(client_id, key, "default", object_size, config)
+    ASSERT_TRUE(service.PutStart(client_id, key, tenant_id, object_size, config)
                     .has_value());
-    ASSERT_TRUE(service.PutEnd(client_id, key, "default", ReplicaType::MEMORY)
+    ASSERT_TRUE(service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY)
                     .has_value());
 
     StorageObjectMetadata metadata;
     metadata.data_size = object_size;
     metadata.transport_endpoint = local_disk_endpoint;
+    metadata.object_version = generate_uuid();
     OffloadTaskItem task{
-        .tenant_id = "default", .key = key, .size = object_size};
+        .tenant_id = tenant_id, .key = key, .size = object_size};
     ASSERT_TRUE(service.NotifyOffloadSuccess(client_id, {task}, {metadata})
                     .has_value());
+}
+
+void AddLocalDiskOnlyObject(MasterService& service, const UUID& holder,
+                            const std::string& key,
+                            const std::string& tenant_id, int64_t object_size,
+                            const UUID& version) {
+    Replica replica(holder, object_size, "local-disk-endpoint",
+                    ReplicaStatus::COMPLETE, version);
+    ASSERT_TRUE(
+        service.AddReplica(holder, key, tenant_id, replica).has_value());
 }
 
 void ExpectNextAllocationOnSegment(MasterService& service,
@@ -348,6 +363,222 @@ TEST_F(MasterServiceSSDTest, RemoveKey) {
     auto get_result = service_->GetReplicaList(key, "default");
     EXPECT_FALSE(get_result.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
+}
+
+TEST_F(MasterServiceSSDTest, RemoveQueuesOnlyActualLocalDiskHolder) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID holder = generate_uuid();
+    const UUID other = generate_uuid();
+    MountMemoryAndLocalDisk(*service, holder, "remove_holder", 0xd00000000);
+    MountMemoryAndLocalDisk(*service, other, "remove_other", 0xe00000000);
+    PutAndOffload(*service, holder, "holder_key", 128, "remove_holder");
+
+    ASSERT_TRUE(service->Remove("holder_key", "default").has_value());
+    auto holder_tasks = service->FetchRemoveTasks(holder, 8);
+    auto other_tasks = service->FetchRemoveTasks(other, 8);
+    ASSERT_TRUE(holder_tasks.has_value());
+    ASSERT_TRUE(other_tasks.has_value());
+    ASSERT_EQ(holder_tasks->size(), 1u);
+    EXPECT_EQ((*holder_tasks)[0].key, "holder_key");
+    EXPECT_TRUE(other_tasks->empty());
+}
+
+TEST_F(MasterServiceSSDTest, RemoveQueuesEveryLocalDiskHolder) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID holder1 = generate_uuid();
+    const UUID holder2 = generate_uuid();
+    MountMemoryAndLocalDisk(*service, holder1, "multi_holder_1", 0xf00000000);
+    MountMemoryAndLocalDisk(*service, holder2, "multi_holder_2", 0x1000000000);
+    PutAndOffload(*service, holder1, "replicated_key", 256, "multi_holder_1");
+    const UUID second_version = generate_uuid();
+    Replica second(holder2, 256, "multi_holder_2", ReplicaStatus::COMPLETE,
+                   second_version);
+    ASSERT_TRUE(
+        service->AddReplica(holder2, "replicated_key", "default", second)
+            .has_value());
+
+    ASSERT_TRUE(service->Remove("replicated_key", "default").has_value());
+    auto first_tasks = service->FetchRemoveTasks(holder1, 8);
+    auto second_tasks = service->FetchRemoveTasks(holder2, 8);
+    ASSERT_TRUE(first_tasks.has_value());
+    ASSERT_TRUE(second_tasks.has_value());
+    ASSERT_EQ(first_tasks->size(), 1u);
+    ASSERT_EQ(second_tasks->size(), 1u);
+    EXPECT_EQ((*second_tasks)[0].object_version, second_version);
+}
+
+TEST_F(MasterServiceSSDTest, RemoveFetchIsAtLeastOnceAndAckIsIdempotent) {
+    auto service = CreateSsdAwareOffloadService();
+    const UUID holder = generate_uuid();
+    MountMemoryAndLocalDisk(*service, holder, "retry_holder", 0x1100000000);
+    PutAndOffload(*service, holder, "retry_key", 64, "retry_holder");
+    ASSERT_TRUE(service->Remove("retry_key", "default").has_value());
+
+    auto first = service->FetchRemoveTasks(holder, 1);
+    auto retry = service->FetchRemoveTasks(holder, 1);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(retry.has_value());
+    ASSERT_EQ(first->size(), 1u);
+    ASSERT_EQ(retry->size(), 1u);
+    EXPECT_EQ((*first)[0].task_id, (*retry)[0].task_id);
+
+    const std::vector<uint64_t> ids{(*first)[0].task_id};
+    EXPECT_TRUE(service->AckRemoveTasks(holder, ids).has_value());
+    EXPECT_TRUE(service->AckRemoveTasks(holder, ids).has_value());
+    auto empty = service->FetchRemoveTasks(holder, 1);
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->empty());
+}
+
+TEST_F(MasterServiceSSDTest, BatchRemoveQueuesOnlySuccessfulKeys) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID holder = generate_uuid();
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
+    AddLocalDiskOnlyObject(*service, holder, "present", "default", 32,
+                           generate_uuid());
+
+    auto results =
+        service->BatchRemove({"present", "missing"}, "default", true);
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_TRUE(results[0].has_value());
+    EXPECT_FALSE(results[1].has_value());
+    auto tasks = service->FetchRemoveTasks(holder, 8);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1u);
+    EXPECT_EQ((*tasks)[0].key, "present");
+}
+
+TEST_F(MasterServiceSSDTest, RemoveTasksAreTenantScoped) {
+    TenantQuotaPolicySnapshot policy;
+    policy.tenant_quotas = {{"tenant-a", 1024 * 1024},
+                            {"tenant-b", 1024 * 1024}};
+    const auto policy_path =
+        std::filesystem::temp_directory_path() /
+        ("mooncake_ssd_remove_tenants_" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()) +
+         ".yaml");
+    {
+        std::ofstream output(policy_path);
+        ASSERT_TRUE(output.is_open());
+        output << FormatTenantQuotaPolicyYaml(policy);
+    }
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(policy_path.string())
+                      .set_default_kv_lease_ttl(0)
+                      .build();
+    auto service = std::make_unique<MasterService>(config);
+    const UUID holder = generate_uuid();
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
+    AddLocalDiskOnlyObject(*service, holder, "same-key", "tenant-a", 16,
+                           generate_uuid());
+    AddLocalDiskOnlyObject(*service, holder, "same-key", "tenant-b", 16,
+                           generate_uuid());
+
+    ASSERT_TRUE(service->Remove("same-key", "tenant-a", true).has_value());
+    auto tasks = service->FetchRemoveTasks(holder, 8);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1u);
+    EXPECT_EQ((*tasks)[0].tenant_id, "tenant-a");
+    EXPECT_TRUE(service->GetReplicaList("same-key", "tenant-b").has_value());
+    service.reset();
+    std::filesystem::remove(policy_path);
+}
+
+TEST_F(MasterServiceSSDTest, RemoveQueueLimitPreservesObjectMetadata) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    config.offloading_queue_limit = 1;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID holder = generate_uuid();
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
+    AddLocalDiskOnlyObject(*service, holder, "first", "default", 16,
+                           generate_uuid());
+    AddLocalDiskOnlyObject(*service, holder, "second", "default", 16,
+                           generate_uuid());
+
+    ASSERT_TRUE(service->Remove("first", "default", true).has_value());
+    auto rejected = service->Remove("second", "default", true);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    EXPECT_TRUE(service->GetReplicaList("second", "default").has_value());
+}
+
+TEST_F(MasterServiceSSDTest, FetchRemoveTasksHonorsRequestedBatchLimit) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID holder = generate_uuid();
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
+    AddLocalDiskOnlyObject(*service, holder, "limited-1", "default", 16,
+                           generate_uuid());
+    AddLocalDiskOnlyObject(*service, holder, "limited-2", "default", 16,
+                           generate_uuid());
+    ASSERT_TRUE(service->Remove("limited-1", "default", true).has_value());
+    ASSERT_TRUE(service->Remove("limited-2", "default", true).has_value());
+
+    auto tasks = service->FetchRemoveTasks(holder, 1);
+    ASSERT_TRUE(tasks.has_value());
+    EXPECT_EQ(tasks->size(), 1u);
+}
+
+TEST_F(MasterServiceSSDTest,
+       BatchRemoveRetainsTaskForOfflineHolderUntilRemount) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID holder = generate_uuid();
+    const UUID version = generate_uuid();
+    AddLocalDiskOnlyObject(*service, holder, "offline-key", "default", 16,
+                           version);
+
+    auto results = service->BatchRemove({"offline-key"}, "default", true);
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results.front().has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
+
+    auto tasks = service->FetchRemoveTasks(holder, 8);
+    ASSERT_TRUE(tasks.has_value());
+    ASSERT_EQ(tasks->size(), 1u);
+    EXPECT_EQ(tasks->front().key, "offline-key");
+    EXPECT_EQ(tasks->front().object_version, version);
+}
+
+TEST_F(MasterServiceSSDTest, BatchCheckRequiresExactHolderVersionAndSize) {
+    MasterServiceConfig config;
+    auto service = std::make_unique<MasterService>(config);
+    const UUID holder = generate_uuid();
+    const UUID other = generate_uuid();
+    const UUID version = generate_uuid();
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(other, true).has_value());
+    AddLocalDiskOnlyObject(*service, holder, "check", "default", 64, version);
+    const LocalDiskObjectInfo object{.tenant_id = "default",
+                                     .key = "check",
+                                     .object_version = version,
+                                     .data_size = 64};
+
+    auto exact = service->BatchCheckLocalDiskReplicas(holder, {object});
+    auto wrong_holder = service->BatchCheckLocalDiskReplicas(other, {object});
+    auto wrong_version = object;
+    wrong_version.object_version = generate_uuid();
+    auto stale = service->BatchCheckLocalDiskReplicas(holder, {wrong_version});
+    auto wrong_size = object;
+    wrong_size.data_size = 63;
+    auto mismatched_size =
+        service->BatchCheckLocalDiskReplicas(holder, {wrong_size});
+    ASSERT_TRUE(exact.has_value());
+    ASSERT_TRUE(wrong_holder.has_value());
+    ASSERT_TRUE(stale.has_value());
+    ASSERT_TRUE(mismatched_size.has_value());
+    EXPECT_EQ((*exact)[0], 1);
+    EXPECT_EQ((*wrong_holder)[0], 0);
+    EXPECT_EQ((*stale)[0], 0);
+    EXPECT_EQ((*mismatched_size)[0], 0);
 }
 
 TEST_F(MasterServiceSSDTest, EvictObject) {

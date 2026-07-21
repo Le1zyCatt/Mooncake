@@ -310,6 +310,31 @@ TEST_F(MasterServiceSSDSnapshotTest, RemoveKey) {
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
 }
 
+TEST_F(MasterServiceSSDSnapshotTest,
+       PendingLocalDiskRemoveTaskRoundTripsUntilAck) {
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 0;
+    CreateMasterServiceWithSSDFeatAndConfig(config);
+
+    const UUID holder = generate_uuid();
+    const UUID version = generate_uuid();
+    Replica replica(holder, 1024, "offline-holder", ReplicaStatus::COMPLETE,
+                    version);
+    ASSERT_TRUE(
+        service_->AddReplica(holder, "snapshot-remove", "default", replica)
+            .has_value());
+    ASSERT_TRUE(
+        service_->Remove("snapshot-remove", "default", true).has_value());
+    ASSERT_TRUE(service_->MountLocalDiskSegment(holder, true).has_value());
+
+    auto delivered = service_->FetchRemoveTasks(holder, 1);
+    ASSERT_TRUE(delivered.has_value());
+    ASSERT_EQ(delivered->size(), 1u);
+    EXPECT_EQ(delivered->front().object_version, version);
+    // Deliberately do not ACK. TearDown snapshots and restores the service;
+    // the base fixture compares the pending task, delivery state, and cursor.
+}
+
 TEST_F(MasterServiceSSDSnapshotTest, EvictObject) {
     // Keep the lease expiry wait below the client live TTL. This test verifies
     // eviction and snapshot restore, not the process-wide default lease TTL.

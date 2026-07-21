@@ -73,9 +73,20 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // LocalDiskSegment state for comparison
     struct LocalDiskSegmentState {
+        struct RemoveState {
+            RemoveTaskItem task;
+            uint32_t delivery_attempts{0};
+            bool inflight{false};
+            bool ready{false};
+
+            bool operator==(const RemoveState&) const = default;
+        };
+
         bool enable_offloading = false;
         std::map<std::string, OffloadTaskItem>
             offloading_objects;  // storage key -> task (sorted)
+        std::map<uint64_t, RemoveState> remove_tasks;
+        uint64_t remove_fetch_cursor{0};
     };
 
     // Task state for comparison
@@ -299,6 +310,16 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 for (const auto& [key, task] : segment->offloading_objects) {
                     seg_state.offloading_objects[key] = task;
                 }
+                seg_state.remove_fetch_cursor = segment->remove_fetch_cursor;
+                for (const auto& [task_id, state] : segment->remove_tasks) {
+                    seg_state.remove_tasks.emplace(
+                        task_id,
+                        LocalDiskSegmentState::RemoveState{
+                            .task = state.task,
+                            .delivery_attempts = state.delivery_attempts,
+                            .inflight = state.inflight,
+                            .ready = state.ready});
+                }
                 state.local_disk_segments[client_id] = std::move(seg_state);
             }
         }
@@ -403,6 +424,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             return false;
         }
         if (a.offloading_objects != b.offloading_objects) {
+            return false;
+        }
+        if (a.remove_tasks != b.remove_tasks ||
+            a.remove_fetch_cursor != b.remove_fetch_cursor) {
             return false;
         }
         return true;
