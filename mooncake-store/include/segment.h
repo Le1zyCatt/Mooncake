@@ -88,8 +88,18 @@ inline std::ostream& operator<<(
 }
 
 struct LocalDiskSegment {
+    struct RemoveTaskState {
+        RemoveTaskItem task;
+        uint32_t delivery_attempts{0};
+        bool inflight{false};
+        bool ready{false};
+    };
+
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
+    // False while the holder is expired.  A segment with pending remove tasks
+    // is retained so a restarted holder can fetch and ACK them.
+    bool connected{true};
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
@@ -100,6 +110,9 @@ struct LocalDiskSegment {
     // offloading_objects (offloading_mutex_).
     std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
         offloading_mutex_) promotion_objects;
+    std::map<uint64_t, RemoveTaskState> GUARDED_BY(offloading_mutex_)
+        remove_tasks;
+    uint64_t GUARDED_BY(offloading_mutex_) remove_fetch_cursor{0};
     explicit LocalDiskSegment(bool enable_offloading)
         : enable_offloading(enable_offloading) {}
 

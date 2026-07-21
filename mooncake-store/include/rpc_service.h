@@ -213,6 +213,15 @@ class WrappedMasterService {
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    tl::expected<std::vector<RemoveTaskItem>, ErrorCode> FetchRemoveTasks(
+        const UUID& client_id, uint32_t max_tasks);
+
+    tl::expected<void, ErrorCode> AckRemoveTasks(
+        const UUID& client_id, const std::vector<uint64_t>& task_ids);
+
+    tl::expected<std::vector<uint8_t>, ErrorCode> BatchCheckLocalDiskReplicas(
+        const UUID& client_id, const std::vector<LocalDiskObjectInfo>& objects);
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 

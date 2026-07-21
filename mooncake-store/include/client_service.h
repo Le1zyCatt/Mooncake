@@ -425,6 +425,16 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
+    virtual tl::expected<void, ErrorCode> FetchRemoveTasks(
+        uint32_t max_tasks, std::vector<RemoveTaskItem>& remove_tasks);
+
+    virtual tl::expected<void, ErrorCode> AckRemoveTasks(
+        const std::vector<uint64_t>& task_ids);
+
+    virtual tl::expected<std::vector<uint8_t>, ErrorCode>
+    BatchCheckLocalDiskReplicas(
+        const std::vector<LocalDiskObjectInfo>& objects);
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         int64_t ssd_total_capacity_bytes);
 

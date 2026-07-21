@@ -1171,6 +1171,30 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+WrappedMasterService::FetchRemoveTasks(const UUID& client_id,
+                                       uint32_t max_tasks) {
+    ScopedVLogTimer timer(1, "FetchRemoveTasks");
+    timer.LogRequest("client_id=", client_id, ", max_tasks=", max_tasks);
+    return master_service_.FetchRemoveTasks(client_id, max_tasks);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::AckRemoveTasks(
+    const UUID& client_id, const std::vector<uint64_t>& task_ids) {
+    ScopedVLogTimer timer(1, "AckRemoveTasks");
+    timer.LogRequest("client_id=", client_id, ", task_count=", task_ids.size());
+    return master_service_.AckRemoveTasks(client_id, task_ids);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+WrappedMasterService::BatchCheckLocalDiskReplicas(
+    const UUID& client_id, const std::vector<LocalDiskObjectInfo>& objects) {
+    ScopedVLogTimer timer(1, "BatchCheckLocalDiskReplicas");
+    timer.LogRequest("client_id=", client_id,
+                     ", object_count=", objects.size());
+    return master_service_.BatchCheckLocalDiskReplicas(client_id, objects);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
     const UUID& client_id, int64_t ssd_total_capacity_bytes) {
     ScopedVLogTimer timer(1, "ReportSsdCapacity");
@@ -1356,6 +1380,13 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::FetchRemoveTasks>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::AckRemoveTasks>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchCheckLocalDiskReplicas>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
         &wrapped_master_service);

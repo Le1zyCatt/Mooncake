@@ -705,11 +705,13 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
                     ErrorCode::DESERIALIZE_FAIL,
                     "serialize_msgpack Replica missing LocalDiskReplicaData"));
             }
-            // Format: [client_id_str, object_size, transport_endpoint]
-            packer.pack_array(3);
+            // Format: [client_id_str, object_size, transport_endpoint,
+            //          object_version]
+            packer.pack_array(4);
             packer.pack(UuidToString(local_data->client_id));
             packer.pack(static_cast<uint64_t>(local_data->object_size));
             packer.pack(local_data->transport_endpoint);
+            packer.pack(UuidToString(local_data->object_version));
             break;
         }
         default:
@@ -788,16 +790,27 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
         case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
             const auto &payload = array_items[3];
             if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 3) {
+                (payload.via.array.size != 3 && payload.via.array.size != 4)) {
                 return tl::unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                        "deserialize_msgpack Replica LOCAL_DISK "
-                                       "payload is not valid array[3]"));
+                                       "payload is not valid array[3 or 4]"));
             }
             auto *payload_items = payload.via.array.ptr;
             std::string client_id_str = payload_items[0].as<std::string>();
             uint64_t object_size = payload_items[1].as<uint64_t>();
             std::string transport_endpoint = payload_items[2].as<std::string>();
+            UUID object_version{0, 0};
+            if (payload.via.array.size == 4) {
+                const auto version_str = payload_items[3].as<std::string>();
+                if (!StringToUuid(version_str, object_version)) {
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        fmt::format("deserialize_msgpack Replica invalid "
+                                    "object version UUID: {}",
+                                    version_str)));
+                }
+            }
 
             UUID client_id;
             if (!StringToUuid(client_id_str, client_id)) {
@@ -808,8 +821,9 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                 client_id_str)));
             }
 
-            replica = std::make_shared<Replica>(
-                client_id, object_size, std::move(transport_endpoint), status);
+            replica = std::make_shared<Replica>(client_id, object_size,
+                                                std::move(transport_endpoint),
+                                                status, object_version);
             break;
         }
         default:

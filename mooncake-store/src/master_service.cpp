@@ -3341,7 +3341,12 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
+    const bool same_holder_exists =
+        metadata.HasReplica([client_id](const Replica& rep) {
+            return rep.is_local_disk_replica() &&
+                   rep.get_local_disk_client_id() == client_id;
+        });
+    if (!same_holder_exists) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
@@ -3351,23 +3356,26 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return true;
     }
 
+    bool updated = false;
     metadata.VisitReplicas(
         [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
+            return rep.is_local_disk_replica() &&
+                   rep.get_local_disk_client_id() == client_id;
         },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+        [&replica, &updated](Replica& rep) {
+            const auto incoming =
+                replica.get_descriptor().get_local_disk_descriptor();
+            const auto current = rep.get_local_disk_object_version();
+            if (current == incoming.object_version || current == UUID{0, 0}) {
+                rep.update_local_disk_location(incoming.object_size,
+                                               incoming.transport_endpoint,
+                                               incoming.object_version);
+                updated = true;
+            }
         });
+    if (!updated) {
+        return tl::make_unexpected(ErrorCode::REPLICA_ALREADY_EXISTS);
+    }
     return false;
 }
 
@@ -4515,9 +4523,18 @@ auto MasterService::Remove(const std::string& key, const std::string& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
+    // Record every holder-specific SSD deletion before erasing the only
+    // metadata that tells us where those replicas live. Queue admission is
+    // all-or-nothing; if it fails, the object remains fully visible.
+    auto queued_tasks = EnqueueLocalDiskRemoveTasks(object_id, metadata);
+    if (!queued_tasks) {
+        return tl::make_unexpected(queued_tasks.error());
+    }
+
     PublishKvRemoved(key, metadata, tenant_id);
     auto& tenant_state [[maybe_unused]] = accessor.GetTenantState();
     accessor.Erase();
+    ActivateLocalDiskRemoveTasks(queued_tasks.value());
     return {};
 }
 
@@ -4726,7 +4743,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             }
 
             // Clean up stale replica handles (consistent with single Remove)
-            if (CleanupStaleHandles(it->second, alive_clients, &shard)) {
+            if (CleanupStaleHandles(it->second, alive_clients, &shard,
+                                    /*preserve_local_disk=*/true)) {
                 // EraseMetadata handles processing_keys,
                 // replication_tasks, offloading_tasks (with
                 // dec_refcnt), and promotion task cleanup.
@@ -4769,9 +4787,19 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
 
+            const ObjectIdentity object_id{normalized_tenant, key};
+            auto queued_tasks =
+                EnqueueLocalDiskRemoveTasks(object_id, metadata);
+            if (!queued_tasks) {
+                results[original_idx] =
+                    tl::make_unexpected(queued_tasks.error());
+                continue;
+            }
+
             // Remove object metadata
             EraseMetadata(tenant_state, it, normalized_tenant,
                           QuotaEraseMode::kFull, &shard);
+            ActivateLocalDiskRemoveTasks(queued_tasks.value());
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
@@ -4785,7 +4813,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 bool MasterService::CleanupStaleHandles(
     ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-    MetadataShardAccessorRW* shard) {
+    MetadataShardAccessorRW* shard, bool preserve_local_disk) {
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -4793,10 +4821,12 @@ bool MasterService::CleanupStaleHandles(
     // segments) and local_disk replicas whose owner client is no longer alive.
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
     EraseReplicasWithCacheTotalAccounting(
-        metadata, [&alive_clients](const Replica& replica) {
+        metadata,
+        [&alive_clients, preserve_local_disk](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(alive_clients)) &&
+                    (!preserve_local_disk &&
+                     replica.has_stale_local_disk_client(alive_clients))) &&
                    replica.is_completed();
         });
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
@@ -4967,6 +4997,213 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     return {};
 }
 
+tl::expected<std::vector<std::pair<UUID, uint64_t>>, ErrorCode>
+MasterService::EnqueueLocalDiskRemoveTasks(const ObjectIdentity& object_id,
+                                           const ObjectMetadata& metadata) {
+    struct PendingInsert {
+        UUID holder;
+        RemoveTaskItem task;
+    };
+    std::vector<PendingInsert> pending;
+    metadata.VisitReplicas(
+        [](const Replica& replica) {
+            return replica.is_local_disk_replica() && replica.is_completed();
+        },
+        [&](const Replica& replica) {
+            const auto holder = replica.get_local_disk_client_id();
+            const auto version = replica.get_local_disk_object_version();
+            if (!holder || !version) return;
+            const auto& descriptor =
+                replica.get_descriptor().get_local_disk_descriptor();
+            pending.push_back(PendingInsert{
+                *holder, RemoveTaskItem{.task_id = replica.id(),
+                                        .tenant_id = object_id.tenant_id,
+                                        .key = object_id.user_key,
+                                        .object_version = *version,
+                                        .data_size = static_cast<int64_t>(
+                                            descriptor.object_size)}});
+        });
+    if (pending.empty()) return std::vector<std::pair<UUID, uint64_t>>{};
+
+    MutexLocker queue_guard(&remove_task_mutex_);
+    ScopedLocalDiskSegmentAccess segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& segments = segment_access.getClientLocalDiskSegment();
+
+    size_t queued_count = 0;
+    for (const auto& [_, segment] : segments) {
+        MutexLocker locker(&segment->offloading_mutex_);
+        queued_count += segment->remove_tasks.size();
+    }
+    if (queued_count + pending.size() > offloading_queue_limit_) {
+        MasterMetricManager::instance().inc_ssd_remove_rejected();
+        LOG(ERROR) << "Rejecting remove because reliable SSD remove queue is "
+                      "full: queued="
+                   << queued_count << ", incoming=" << pending.size()
+                   << ", limit=" << offloading_queue_limit_;
+        return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    }
+
+    std::vector<std::pair<UUID, uint64_t>> inserted;
+    size_t newly_inserted = 0;
+    for (const auto& item : pending) {
+        auto segment_it = segments.find(item.holder);
+        if (segment_it == segments.end()) {
+            // The holder can be offline when another client deletes the
+            // object. Retain a disconnected placeholder so the task survives
+            // snapshots and becomes fetchable when that holder remounts.
+            auto [created_it, created] = segments.emplace(
+                item.holder, std::make_shared<LocalDiskSegment>(false));
+            segment_it = created_it;
+            if (created) segment_it->second->connected = false;
+        }
+        MutexLocker locker(&segment_it->second->offloading_mutex_);
+        auto [task_it, did_insert] = segment_it->second->remove_tasks.emplace(
+            item.task.task_id,
+            LocalDiskSegment::RemoveTaskState{.task = item.task});
+        if (!did_insert) {
+            // A restored pre-commit task may still be hidden. Reusing it for
+            // the same replica lets a retried Remove complete safely.
+            task_it->second.task = item.task;
+            task_it->second.ready = false;
+            task_it->second.inflight = false;
+        } else {
+            ++newly_inserted;
+        }
+        inserted.emplace_back(item.holder, item.task.task_id);
+    }
+    MasterMetricManager::instance().inc_ssd_remove_enqueued(newly_inserted);
+    if (!inserted.empty()) {
+        LOG(INFO) << "Queued " << inserted.size()
+                  << " reliable LOCAL_DISK remove task(s) for tenant="
+                  << object_id.tenant_id << ", key=" << object_id.user_key;
+    }
+    return inserted;
+}
+
+void MasterService::ActivateLocalDiskRemoveTasks(
+    const std::vector<std::pair<UUID, uint64_t>>& queued_tasks) {
+    MutexLocker queue_guard(&remove_task_mutex_);
+    ScopedLocalDiskSegmentAccess segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& segments = segment_access.getClientLocalDiskSegment();
+    for (const auto& [holder, task_id] : queued_tasks) {
+        auto it = segments.find(holder);
+        if (it == segments.end()) continue;
+        MutexLocker locker(&it->second->offloading_mutex_);
+        auto task_it = it->second->remove_tasks.find(task_id);
+        if (task_it != it->second->remove_tasks.end()) {
+            task_it->second.ready = true;
+        }
+    }
+}
+
+auto MasterService::FetchRemoveTasks(const UUID& client_id, uint32_t max_tasks)
+    -> tl::expected<std::vector<RemoveTaskItem>, ErrorCode> {
+    if (max_tasks == 0) return std::vector<RemoveTaskItem>{};
+    max_tasks = std::min(max_tasks, kMaxRemoveTasksPerFetch);
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    MutexLocker queue_guard(&remove_task_mutex_);
+    ScopedLocalDiskSegmentAccess segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& segments = segment_access.getClientLocalDiskSegment();
+    auto segment_it = segments.find(client_id);
+    if (segment_it == segments.end()) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&segment_it->second->offloading_mutex_);
+    if (!segment_it->second->connected) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    auto& queue = segment_it->second->remove_tasks;
+    std::vector<RemoveTaskItem> result;
+    result.reserve(std::min<size_t>(max_tasks, queue.size()));
+    if (queue.empty()) return result;
+
+    auto it = queue.upper_bound(segment_it->second->remove_fetch_cursor);
+    if (it == queue.end()) it = queue.begin();
+    const auto start = it;
+    do {
+        if (it->second.ready) {
+            it->second.inflight = true;
+            ++it->second.delivery_attempts;
+            result.push_back(it->second.task);
+            segment_it->second->remove_fetch_cursor = it->first;
+        }
+        ++it;
+        if (it == queue.end()) it = queue.begin();
+    } while (result.size() < max_tasks && it != start);
+    MasterMetricManager::instance().inc_ssd_remove_delivered(result.size());
+    return result;
+}
+
+auto MasterService::AckRemoveTasks(const UUID& client_id,
+                                   const std::vector<uint64_t>& task_ids)
+    -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    MutexLocker queue_guard(&remove_task_mutex_);
+    ScopedLocalDiskSegmentAccess segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& segments = segment_access.getClientLocalDiskSegment();
+    auto segment_it = segments.find(client_id);
+    if (segment_it == segments.end()) {
+        // ACK is idempotent even if an already-empty disconnected segment was
+        // reclaimed.
+        return {};
+    }
+    size_t acked = 0;
+    bool reclaim_disconnected_segment = false;
+    {
+        MutexLocker locker(&segment_it->second->offloading_mutex_);
+        for (const uint64_t task_id : task_ids) {
+            acked += segment_it->second->remove_tasks.erase(task_id);
+        }
+        reclaim_disconnected_segment =
+            segment_it->second->remove_tasks.empty() &&
+            !segment_it->second->connected;
+    }
+    if (reclaim_disconnected_segment) {
+        segments.erase(segment_it);
+    }
+    MasterMetricManager::instance().inc_ssd_remove_acked(acked);
+    return {};
+}
+
+auto MasterService::BatchCheckLocalDiskReplicas(
+    const UUID& client_id, const std::vector<LocalDiskObjectInfo>& objects)
+    -> tl::expected<std::vector<uint8_t>, ErrorCode> {
+    if (objects.size() > kMaxReconcileObjectsPerRequest) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<uint8_t> result;
+    result.reserve(objects.size());
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    for (const auto& object : objects) {
+        const auto object_id =
+            MakeObjectIdentityForRequest(object.key, object.tenant_id);
+        MetadataAccessorRO accessor(this, object_id);
+        bool matches = false;
+        if (accessor.Exists()) {
+            accessor.Get().VisitReplicas(
+                [&](const Replica& replica) {
+                    return replica.is_local_disk_replica() &&
+                           replica.is_completed() &&
+                           replica.get_local_disk_client_id() == client_id &&
+                           replica.get_local_disk_object_version() ==
+                               object.object_version;
+                },
+                [&](const Replica& replica) {
+                    matches = replica.get_descriptor()
+                                  .get_local_disk_descriptor()
+                                  .object_size ==
+                              static_cast<uint64_t>(object.data_size);
+                });
+        }
+        result.push_back(matches ? uint8_t{1} : uint8_t{0});
+    }
+    return result;
+}
+
 auto MasterService::ReportSsdCapacity(const UUID& client_id,
                                       int64_t ssd_total_capacity_bytes)
     -> tl::expected<void, ErrorCode> {
@@ -5048,7 +5285,8 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
+                        metadata.object_version);
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
@@ -5077,8 +5315,12 @@ auto MasterService::NotifyOffloadSuccess(
                     }
                     tenant_state.offloading_tasks.erase(task_it);
 
-                    if (!obj_metadata.HasReplica(
-                            &Replica::fn_is_local_disk_replica)) {
+                    const bool same_holder_exists = obj_metadata.HasReplica(
+                        [client_id](const Replica& rep) {
+                            return rep.is_local_disk_replica() &&
+                                   rep.get_local_disk_client_id() == client_id;
+                        });
+                    if (!same_holder_exists) {
                         std::vector<Replica> replicas;
                         replicas.emplace_back(std::move(replica));
                         obj_metadata.AddReplicas(std::move(replicas));
@@ -5087,6 +5329,7 @@ auto MasterService::NotifyOffloadSuccess(
                         SyncCacheTotalAccounting(obj_metadata);
                         added_new_local_disk_replica = true;
                     } else {
+                        bool updated = false;
                         obj_metadata.VisitReplicas(
                             [client_id](const Replica& rep) {
                                 return rep.type() == ReplicaType::LOCAL_DISK &&
@@ -5094,20 +5337,25 @@ auto MasterService::NotifyOffloadSuccess(
                                                .get_local_disk_descriptor()
                                                .client_id == client_id;
                             },
-                            [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
+                            [&replica, &updated](Replica& rep) {
+                                const auto incoming =
                                     replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
+                                        .get_local_disk_descriptor();
+                                const auto current =
+                                    rep.get_local_disk_object_version();
+                                if (current == incoming.object_version ||
+                                    current == UUID{0, 0}) {
+                                    rep.update_local_disk_location(
+                                        incoming.object_size,
+                                        incoming.transport_endpoint,
+                                        incoming.object_version);
+                                    updated = true;
+                                }
                             });
+                        if (!updated) {
+                            return tl::make_unexpected(
+                                ErrorCode::REPLICA_ALREADY_EXISTS);
+                        }
                     }
                     handled_existing_object = true;
                 }
@@ -5115,27 +5363,66 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         if (!handled_existing_object) {
-            auto normalized_tenant_result =
-                NormalizeTenantIdForWrite(request_object_id.tenant_id);
-            if (!normalized_tenant_result) {
-                return tl::make_unexpected(normalized_tenant_result.error());
+            // Non-bucket backends use the legacy zero incarnation and retain
+            // their established restart registration behavior. Bucket-backed
+            // entries always carry a generated UUID and must already match an
+            // exact Master replica after startup reconciliation.
+            if (metadata.object_version == UUID{0, 0}) {
+                auto normalized_tenant_result =
+                    NormalizeTenantIdForWrite(request_object_id.tenant_id);
+                if (!normalized_tenant_result) {
+                    return tl::make_unexpected(
+                        normalized_tenant_result.error());
+                }
+                const ObjectIdentity object_id{normalized_tenant_result.value(),
+                                               request_object_id.user_key};
+                auto added = AddReplica(client_id, object_id.user_key,
+                                        object_id.tenant_id, replica);
+                if (!added) {
+                    return tl::make_unexpected(added.error());
+                }
+                added_new_local_disk_replica = added.value();
+                handled_existing_object = true;
             }
-            const ObjectIdentity object_id{normalized_tenant_result.value(),
-                                           request_object_id.user_key};
 
-            auto res = AddReplica(client_id, object_id.user_key,
-                                  object_id.tenant_id, replica);
-            if (!res) {
-                if (res.error() == ErrorCode::OBJECT_NOT_FOUND) {
+            if (!handled_existing_object) {
+                // A completion without the original offloading task is either
+                // an old in-flight write or startup recovery. Startup recovery
+                // first verifies an already-existing exact version via
+                // BatchCheckLocalDiskReplicas, so it is safe only when that
+                // exact replica is still present.
+                std::shared_lock<std::shared_mutex> shared_lock(
+                    snapshot_mutex_);
+                MetadataAccessorRW accessor(this, request_object_id);
+                bool matched = false;
+                if (accessor.Exists()) {
+                    accessor.Get().VisitReplicas(
+                        [&](const Replica& rep) {
+                            return rep.is_local_disk_replica() &&
+                                   rep.get_local_disk_client_id() ==
+                                       client_id &&
+                                   rep.get_local_disk_object_version() ==
+                                       metadata.object_version;
+                        },
+                        [&](Replica& rep) {
+                            rep.update_local_disk_location(
+                                metadata.data_size, metadata.transport_endpoint,
+                                metadata.object_version);
+                            matched = true;
+                        });
+                }
+                if (!matched) {
+                    LOG(WARNING) << "Ignoring stale LOCAL_DISK completion for "
+                                 << "tenant=" << request_object_id.tenant_id
+                                 << ", key=" << request_object_id.user_key;
+                    // The object may have been removed after startup's exact
+                    // BatchCheck. Do not recreate it and do not fail the
+                    // holder's entire startup scan; a queued remove task (or
+                    // the next reconciliation) will reclaim the local copy.
                     continue;
                 }
-                LOG(ERROR) << "Failed to add replica: error=" << res.error()
-                           << ", client_id=" << client_id
-                           << ", tenant_id=" << object_id.tenant_id
-                           << ", key=" << object_id.user_key;
-                return tl::make_unexpected(res.error());
+                handled_existing_object = true;
             }
-            added_new_local_disk_replica = res.value();
         }
         if (local_disk_segment && metadata.data_size > 0 &&
             added_new_local_disk_replica) {

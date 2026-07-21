@@ -646,6 +646,27 @@ class MasterService {
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode>;
 
+    /**
+     * Fetches (without removing) a bounded, rotating window of holder-specific
+     * SSD delete tasks. Tasks remain durable snapshot state until ACKed.
+     */
+    auto FetchRemoveTasks(const UUID& client_id, uint32_t max_tasks)
+        -> tl::expected<std::vector<RemoveTaskItem>, ErrorCode>;
+
+    /** Idempotently acknowledges tombstones that are already durable locally.
+     */
+    auto AckRemoveTasks(const UUID& client_id,
+                        const std::vector<uint64_t>& task_ids)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * Bounded startup reconciliation for local SSD entries. A true result
+     * means Master still owns the exact holder/version replica.
+     */
+    auto BatchCheckLocalDiskReplicas(
+        const UUID& client_id, const std::vector<LocalDiskObjectInfo>& objects)
+        -> tl::expected<std::vector<uint8_t>, ErrorCode>;
+
     auto ReportSsdCapacity(const UUID& client_id,
                            int64_t ssd_total_capacity_bytes)
         -> tl::expected<void, ErrorCode>;
@@ -1498,7 +1519,8 @@ class MasterService {
     bool CleanupStaleHandles(
         ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-        MetadataShardAccessorRW* shard = nullptr);
+        MetadataShardAccessorRW* shard = nullptr,
+        bool preserve_local_disk = false);
 
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
@@ -1535,6 +1557,13 @@ class MasterService {
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(
         const ObjectIdentity& object_id, Replica& replica);
+
+    tl::expected<std::vector<std::pair<UUID, uint64_t>>, ErrorCode>
+    EnqueueLocalDiskRemoveTasks(const ObjectIdentity& object_id,
+                                const ObjectMetadata& metadata);
+
+    void ActivateLocalDiskRemoveTasks(
+        const std::vector<std::pair<UUID, uint64_t>>& queued_tasks);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
@@ -2125,6 +2154,9 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
+    mutable Mutex remove_task_mutex_;
+    static constexpr uint32_t kMaxRemoveTasksPerFetch = 256;
+    static constexpr size_t kMaxReconcileObjectsPerRequest = 1024;
     double offload_cap_ratio_ = 0.5;
 
     // Task manager

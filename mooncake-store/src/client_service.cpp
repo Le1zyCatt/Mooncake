@@ -3043,6 +3043,25 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::FetchRemoveTasks(
+    uint32_t max_tasks, std::vector<RemoveTaskItem>& remove_tasks) {
+    auto response = master_client_.FetchRemoveTasks(client_id_, max_tasks);
+    if (!response) return tl::make_unexpected(response.error());
+    remove_tasks = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::AckRemoveTasks(
+    const std::vector<uint64_t>& task_ids) {
+    return master_client_.AckRemoveTasks(client_id_, task_ids);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+Client::BatchCheckLocalDiskReplicas(
+    const std::vector<LocalDiskObjectInfo>& objects) {
+    return master_client_.BatchCheckLocalDiskReplicas(client_id_, objects);
+}
+
 tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
     int64_t ssd_total_capacity_bytes) {
     auto response =

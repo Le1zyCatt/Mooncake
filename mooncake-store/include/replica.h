@@ -181,6 +181,7 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    UUID object_version{0, 0};
 };
 
 struct MemoryDescriptor {
@@ -203,7 +204,9 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    UUID object_version{0, 0};
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             object_version);
 };
 
 class Replica {
@@ -242,10 +245,12 @@ class Replica {
 
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
-            std::string transport_endpoint, ReplicaStatus status)
+            std::string transport_endpoint, ReplicaStatus status,
+            UUID object_version = {0, 0})
         : id_(next_id_.fetch_add(1)),
           data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
+                                     std::move(transport_endpoint),
+                                     object_version}),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -412,6 +417,25 @@ class Replica {
             return disk_data.client_id;
         }
         return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<UUID> get_local_disk_object_version() const {
+        if (is_local_disk_replica()) {
+            return std::get<LocalDiskReplicaData>(data_).object_version;
+        }
+        return std::nullopt;
+    }
+
+    void update_local_disk_location(uint64_t object_size,
+                                    std::string transport_endpoint,
+                                    UUID object_version) {
+        if (!is_local_disk_replica()) {
+            return;
+        }
+        auto& data = std::get<LocalDiskReplicaData>(data_);
+        data.object_size = object_size;
+        data.transport_endpoint = std::move(transport_endpoint);
+        data.object_version = object_version;
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {
@@ -627,6 +651,7 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        local_disk_desc.object_version = disk_data.object_version;
         desc.descriptor_variant = std::move(local_disk_desc);
     }
 

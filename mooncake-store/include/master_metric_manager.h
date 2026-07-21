@@ -315,6 +315,12 @@ class MasterMetricManager {
     void inc_promotion_rejected_watermark(int64_t val = 1);
     void inc_promotion_rejected_cap(int64_t val = 1);
 
+    // Reliable LOCAL_DISK explicit-delete queue metrics.
+    void inc_ssd_remove_enqueued(int64_t val = 1);
+    void inc_ssd_remove_delivered(int64_t val = 1);
+    void inc_ssd_remove_acked(int64_t val = 1);
+    void inc_ssd_remove_rejected(int64_t val = 1);
+
     // Tenant quota metrics
     void inc_tenant_quota_reject(const std::string& tenant_id,
                                  const std::string& reason, int64_t val = 1);
@@ -703,6 +709,11 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_candidate_expired_evaluated_;
     ylt::metric::counter_t promotion_candidate_expired_unevaluated_;
     ylt::metric::counter_t promotion_candidate_dropped_limit_;
+
+    ylt::metric::counter_t ssd_remove_enqueued_;
+    ylt::metric::counter_t ssd_remove_delivered_;
+    ylt::metric::counter_t ssd_remove_acked_;
+    ylt::metric::counter_t ssd_remove_rejected_;
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;

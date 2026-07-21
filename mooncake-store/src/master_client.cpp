@@ -223,6 +223,21 @@ struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::FetchRemoveTasks> {
+    static constexpr const char* value = "FetchRemoveTasks";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::AckRemoveTasks> {
+    static constexpr const char* value = "AckRemoveTasks";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchCheckLocalDiskReplicas> {
+    static constexpr const char* value = "BatchCheckLocalDiskReplicas";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
     static constexpr const char* value = "ReportSsdCapacity";
 };
@@ -986,6 +1001,32 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
         invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
                    std::vector<OffloadTaskItem>>(client_id, enable_offloading);
     return result;
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+MasterClient::FetchRemoveTasks(const UUID& client_id, uint32_t max_tasks) {
+    ScopedVLogTimer timer(1, "MasterClient::FetchRemoveTasks");
+    timer.LogRequest("client_id=", client_id, ", max_tasks=", max_tasks);
+    return invoke_rpc<&WrappedMasterService::FetchRemoveTasks,
+                      std::vector<RemoveTaskItem>>(client_id, max_tasks);
+}
+
+tl::expected<void, ErrorCode> MasterClient::AckRemoveTasks(
+    const UUID& client_id, const std::vector<uint64_t>& task_ids) {
+    ScopedVLogTimer timer(1, "MasterClient::AckRemoveTasks");
+    timer.LogRequest("client_id=", client_id, ", task_count=", task_ids.size());
+    return invoke_rpc<&WrappedMasterService::AckRemoveTasks, void>(client_id,
+                                                                   task_ids);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+MasterClient::BatchCheckLocalDiskReplicas(
+    const UUID& client_id, const std::vector<LocalDiskObjectInfo>& objects) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchCheckLocalDiskReplicas");
+    timer.LogRequest("client_id=", client_id,
+                     ", object_count=", objects.size());
+    return invoke_rpc<&WrappedMasterService::BatchCheckLocalDiskReplicas,
+                      std::vector<uint8_t>>(client_id, objects);
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(

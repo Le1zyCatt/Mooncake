@@ -225,6 +225,16 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
         segment_manager_->client_local_disk_segment_.find(client_id);
     if (exist_segment_it !=
         segment_manager_->client_local_disk_segment_.end()) {
+        MutexLocker locker(&exist_segment_it->second->offloading_mutex_);
+        if (!exist_segment_it->second->connected) {
+            exist_segment_it->second->connected = true;
+            exist_segment_it->second->enable_offloading = enable_offloading;
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=remount_local_disk_segment_with_pending_"
+                         "remove_tasks, count="
+                      << exist_segment_it->second->remove_tasks.size();
+            return ErrorCode::OK;
+        }
         LOG(WARNING) << "client_id=" << client_id
                      << ", warn=local_disk_segment_already_exists";
         return ErrorCode::SEGMENT_ALREADY_EXISTS;
@@ -421,17 +431,28 @@ void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
         // don't unlock an already-destroyed mutex (erase destroys the
         // LocalDiskSegment, including its mutex).
         int64_t reported_capacity = 0;
+        bool has_pending_remove_tasks = false;
         {
             MutexLocker locker(&it->second->offloading_mutex_);
             reported_capacity = it->second->ssd_total_capacity_bytes;
+            it->second->ssd_total_capacity_bytes = 0;
+            it->second->enable_offloading = false;
+            it->second->connected = false;
+            has_pending_remove_tasks = !it->second->remove_tasks.empty();
         }
         if (reported_capacity > 0) {
             MasterMetricManager::instance().dec_total_file_capacity(
                 reported_capacity);
         }
-        segment_manager_->client_local_disk_segment_.erase(it);
-        LOG(INFO) << "client_id=" << client_id
-                  << ", action=unmount_local_disk_segment";
+        if (has_pending_remove_tasks) {
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=retain_local_disk_segment_for_pending_"
+                         "remove_tasks";
+        } else {
+            segment_manager_->client_local_disk_segment_.erase(it);
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=unmount_local_disk_segment";
+        }
     }
 }
 
@@ -680,9 +701,9 @@ SegmentSerializer::Serialize() {
         }
         std::sort(sorted_keys.begin(), sorted_keys.end());
 
-        // Trailing ssd_total_capacity_bytes so a restored master keeps the
-        // client-reported SSD capacity across a snapshot restore (#2783).
-        packer.pack_array(2 + sorted_keys.size() * 2 + 1);
+        // Trailing fields are append-only for snapshot compatibility:
+        // capacity, connection state, fetch cursor, and reliable remove tasks.
+        packer.pack_array(2 + sorted_keys.size() * 2 + 4);
         packer.pack(segment->enable_offloading);
         packer.pack(static_cast<uint64_t>(sorted_keys.size()));
 
@@ -695,6 +716,20 @@ SegmentSerializer::Serialize() {
             packer.pack(task.size);
         }
         packer.pack(segment->ssd_total_capacity_bytes);
+        packer.pack(segment->connected);
+        packer.pack(segment->remove_fetch_cursor);
+        packer.pack_array(segment->remove_tasks.size());
+        for (const auto& [task_id, state] : segment->remove_tasks) {
+            packer.pack_array(8);
+            packer.pack(task_id);
+            packer.pack(state.task.tenant_id);
+            packer.pack(state.task.key);
+            packer.pack(UuidToString(state.task.object_version));
+            packer.pack(state.task.data_size);
+            packer.pack(state.delivery_attempts);
+            packer.pack(state.inflight);
+            packer.pack(state.ready);
+        }
     }
 
     // Compress entire data
@@ -1030,6 +1065,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
 
             auto segment =
                 std::make_shared<LocalDiskSegment>(enable_offloading);
+            // Snapshot recovery never restores a live transport connection.
+            segment->connected = false;
 
             // Parse offloading_objects
             for (uint64_t k = 0; k < count; ++k) {
@@ -1101,6 +1138,68 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 IsMsgpackInteger(client_value.via.array.ptr[capacity_idx])) {
                 segment->ssd_total_capacity_bytes =
                     client_value.via.array.ptr[capacity_idx].as<int64_t>();
+            }
+
+            const size_t connected_idx = capacity_idx + 1;
+            if (client_value.via.array.size > connected_idx &&
+                client_value.via.array.ptr[connected_idx].type ==
+                    msgpack::type::BOOLEAN) {
+                // A restored process has no live client connection even if
+                // the snapshot was taken while the holder was connected.
+                // Keep the field for wire compatibility, but force remount.
+                segment->connected = false;
+            }
+
+            const size_t cursor_idx = capacity_idx + 2;
+            if (client_value.via.array.size > cursor_idx &&
+                IsMsgpackInteger(client_value.via.array.ptr[cursor_idx])) {
+                segment->remove_fetch_cursor =
+                    client_value.via.array.ptr[cursor_idx].as<uint64_t>();
+            }
+
+            const size_t tasks_idx = capacity_idx + 3;
+            if (client_value.via.array.size > tasks_idx) {
+                const auto& tasks_obj = client_value.via.array.ptr[tasks_idx];
+                if (tasks_obj.type != msgpack::type::ARRAY) {
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        "deserialize local_disk_segments remove_tasks is not "
+                        "an array"));
+                }
+                for (uint32_t task_index = 0;
+                     task_index < tasks_obj.via.array.size; ++task_index) {
+                    const auto& state_obj = tasks_obj.via.array.ptr[task_index];
+                    if (state_obj.type != msgpack::type::ARRAY ||
+                        (state_obj.via.array.size != 7 &&
+                         state_obj.via.array.size != 8)) {
+                        return tl::unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "deserialize local_disk_segments remove task is "
+                            "not array[7 or 8]"));
+                    }
+                    const auto* fields = state_obj.via.array.ptr;
+                    UUID object_version;
+                    const auto version = fields[3].as<std::string>();
+                    if (!StringToUuid(version, object_version)) {
+                        return tl::unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "deserialize local_disk_segments remove task has "
+                            "invalid object version"));
+                    }
+                    LocalDiskSegment::RemoveTaskState state;
+                    state.task.task_id = fields[0].as<uint64_t>();
+                    state.task.tenant_id = fields[1].as<std::string>();
+                    state.task.key = fields[2].as<std::string>();
+                    state.task.object_version = object_version;
+                    state.task.data_size = fields[4].as<int64_t>();
+                    state.delivery_attempts = fields[5].as<uint32_t>();
+                    state.inflight = fields[6].as<bool>();
+                    state.ready = state_obj.via.array.size == 8
+                                      ? fields[7].as<bool>()
+                                      : true;
+                    segment->remove_tasks.emplace(state.task.task_id,
+                                                  std::move(state));
+                }
             }
 
             segment_manager_->client_local_disk_segment_[client_id] =

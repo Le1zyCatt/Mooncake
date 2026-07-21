@@ -396,6 +396,16 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_candidate_dropped_limit_total",
           "Promotion retry candidates dropped at record time because the "
           "global candidate count limit was reached"),
+      ssd_remove_enqueued_("master_ssd_remove_enqueued_total",
+                           "Holder-specific LOCAL_DISK remove tasks admitted"),
+      ssd_remove_delivered_(
+          "master_ssd_remove_delivered_total",
+          "LOCAL_DISK remove task deliveries, including retries"),
+      ssd_remove_acked_("master_ssd_remove_acked_total",
+                        "Durably tombstoned LOCAL_DISK remove tasks ACKed"),
+      ssd_remove_rejected_(
+          "master_ssd_remove_rejected_total",
+          "Object removals rejected because the SSD remove queue was full"),
       tenant_quota_reject_total_(
           "mooncake_tenant_quota_reject_total",
           "Total number of tenant quota admission rejects",
@@ -1172,6 +1182,18 @@ void MasterMetricManager::inc_promotion_rejected_watermark(int64_t val) {
 }
 void MasterMetricManager::inc_promotion_rejected_cap(int64_t val) {
     promotion_rejected_cap_.inc(val);
+}
+void MasterMetricManager::inc_ssd_remove_enqueued(int64_t val) {
+    ssd_remove_enqueued_.inc(val);
+}
+void MasterMetricManager::inc_ssd_remove_delivered(int64_t val) {
+    ssd_remove_delivered_.inc(val);
+}
+void MasterMetricManager::inc_ssd_remove_acked(int64_t val) {
+    ssd_remove_acked_.inc(val);
+}
+void MasterMetricManager::inc_ssd_remove_rejected(int64_t val) {
+    ssd_remove_rejected_.inc(val);
 }
 void MasterMetricManager::inc_promotion_candidate_recorded(int64_t val) {
     promotion_candidate_recorded_.inc(val);
