@@ -11,6 +11,7 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -26,6 +27,105 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
+
+namespace {
+
+tl::expected<void, ErrorCode> FsyncPath(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    const int rc = ::fsync(fd);
+    const int saved_errno = errno;
+    ::close(fd);
+    if (rc != 0) {
+        LOG(ERROR) << "fsync failed for " << path << ": "
+                   << strerror(saved_errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FsyncParentDirectory(const std::string& path) {
+    const auto parent = std::filesystem::path(path).parent_path();
+    int fd = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    const int rc = ::fsync(fd);
+    const int saved_errno = errno;
+    ::close(fd);
+    if (rc != 0) {
+        LOG(ERROR) << "directory fsync failed for " << parent << ": "
+                   << strerror(saved_errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<std::string, ErrorCode> WriteDurableTempFile(
+    const std::string& path, std::string_view contents) {
+    static std::atomic<uint64_t> next_tmp_id{1};
+    const std::string tmp_path =
+        path + ".tmp." + std::to_string(::getpid()) + "." +
+        std::to_string(next_tmp_id.fetch_add(1, std::memory_order_relaxed));
+    int fd =
+        ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        LOG(ERROR) << "failed to create metadata temp file " << tmp_path << ": "
+                   << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    size_t written = 0;
+    while (written < contents.size()) {
+        const ssize_t rc =
+            ::write(fd, contents.data() + written, contents.size() - written);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            const int saved_errno = errno;
+            ::close(fd);
+            ::unlink(tmp_path.c_str());
+            LOG(ERROR) << "failed to write metadata temp file " << tmp_path
+                       << ": " << strerror(saved_errno);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written += static_cast<size_t>(rc);
+    }
+    if (::fsync(fd) != 0) {
+        const int saved_errno = errno;
+        ::close(fd);
+        ::unlink(tmp_path.c_str());
+        LOG(ERROR) << "failed to fsync metadata temp file " << tmp_path << ": "
+                   << strerror(saved_errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (::close(fd) != 0) {
+        ::unlink(tmp_path.c_str());
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return tmp_path;
+}
+
+tl::expected<void, ErrorCode> PublishDurableTempFile(
+    const std::string& tmp_path, const std::string& path) {
+    if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        const int saved_errno = errno;
+        ::unlink(tmp_path.c_str());
+        LOG(ERROR) << "failed to publish metadata file " << path << ": "
+                   << strerror(saved_errno);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return FsyncParentDirectory(path);
+}
+
+tl::expected<void, ErrorCode> AtomicWriteFile(const std::string& path,
+                                              std::string_view contents) {
+    auto staged = WriteDurableTempFile(path, contents);
+    if (!staged) return tl::make_unexpected(staged.error());
+    return PublishDurableTempFile(staged.value(), path);
+}
+
+}  // namespace
 
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
@@ -1941,8 +2041,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         object_bucket_map_.clear();
         buckets_.clear();
         lru_index_.clear();
+        retired_buckets_.clear();
         total_size_ = 0;
+        tombstoned_bytes_.store(0, std::memory_order_relaxed);
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
+        std::unordered_set<int64_t> superseded_bucket_ids;
 
         for (const auto& entry :
              fs::recursive_directory_iterator(storage_path_)) {
@@ -2019,7 +2122,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 auto& meta = *(metadata_it->second);
                 if (meta.data_size == 0 || meta.meta_size == 0 ||
-                    meta.metadatas.empty() || meta.keys.empty()) {
+                    meta.metadatas.empty() || meta.keys.empty() ||
+                    meta.keys.size() != meta.metadatas.size()) {
                     LOG(ERROR) << "Metadata validation failed for bucket: "
                                << bucket_id_str
                                << ", will delete the bucket's data and "
@@ -2057,15 +2161,66 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
-                for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
-                    object_bucket_map_.emplace(
-                        metadata_it->second->keys[i],
-                        StorageObjectMetadata{
-                            metadata_it->first,
-                            metadata_it->second->metadatas[i].offset,
-                            metadata_it->second->metadatas[i].key_size,
-                            metadata_it->second->metadatas[i].data_size, ""});
+                if (meta.compacted_from_bucket_id >= 0) {
+                    superseded_bucket_ids.insert(meta.compacted_from_bucket_id);
                 }
+                std::unordered_set<std::string> tombstones(
+                    meta.tombstones.begin(), meta.tombstones.end());
+                int64_t deleted_bytes = 0;
+                for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
+                    const auto& object_meta = meta.metadatas[i];
+                    if (tombstones.contains(meta.keys[i])) {
+                        deleted_bytes +=
+                            object_meta.key_size + object_meta.data_size;
+                        continue;
+                    }
+                    StorageObjectMetadata storage_meta{
+                        metadata_it->first,
+                        object_meta.offset,
+                        object_meta.key_size,
+                        object_meta.data_size,
+                        "",
+                        object_meta.object_version};
+                    auto existing = object_bucket_map_.find(meta.keys[i]);
+                    if (existing == object_bucket_map_.end() ||
+                        existing->second.bucket_id < metadata_it->first) {
+                        object_bucket_map_.insert_or_assign(
+                            meta.keys[i], std::move(storage_meta));
+                    }
+                }
+                meta.deleted_bytes_.store(deleted_bytes,
+                                          std::memory_order_relaxed);
+                tombstoned_bytes_.fetch_add(deleted_bytes,
+                                            std::memory_order_relaxed);
+            }
+        }
+
+        // A committed compaction output is identified by the presence of its
+        // .meta file.  It supersedes the source even if the process crashed
+        // before deleting the old files or updating the in-memory maps.
+        for (const int64_t source_id : superseded_bucket_ids) {
+            auto source_it = buckets_.find(source_id);
+            if (source_it == buckets_.end()) {
+                continue;
+            }
+            auto source = source_it->second;
+            for (const auto& key : source->keys) {
+                auto object_it = object_bucket_map_.find(key);
+                if (object_it != object_bucket_map_.end() &&
+                    object_it->second.bucket_id == source_id) {
+                    object_bucket_map_.erase(object_it);
+                }
+            }
+            lru_index_.erase({0LL, source_id});
+            buckets_.erase(source_it);
+            const int64_t physical_size = source->data_size + source->meta_size;
+            const int64_t deleted =
+                source->deleted_bytes_.load(std::memory_order_relaxed);
+            if (RemoveBucketFiles(source_id)) {
+                total_size_ -= physical_size;
+                tombstoned_bytes_.fetch_sub(deleted, std::memory_order_relaxed);
+            } else {
+                retired_buckets_.emplace(source_id, std::move(source));
             }
         }
 
@@ -2074,6 +2229,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         // succeeded but metadata write failed
         std::unordered_set<int64_t> valid_bucket_ids;
         for (const auto& [id, _] : buckets_) {
+            valid_bucket_ids.insert(id);
+        }
+        for (const auto& [id, _] : retired_buckets_) {
             valid_bucket_ids.insert(id);
         }
 
@@ -2087,6 +2245,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             }
 
             std::string extension = entry.path().extension().string();
+
+            // Temporary compaction/metadata files are never committed and can
+            // be discarded on startup.
+            if (entry.path().filename().string().find(".meta.tmp.") !=
+                std::string::npos) {
+                std::error_code cleanup_ec;
+                fs::remove(entry.path(), cleanup_ec);
+                continue;
+            }
 
             // Only process .bucket files
             if (extension != BUCKET_DATA_FILE_SUFFIX) {
@@ -2174,6 +2341,365 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     return object_bucket_map_.find(key) != object_bucket_map_.end();
 }
 
+tl::expected<MarkRemovedResult, ErrorCode> BucketStorageBackend::MarkRemoved(
+    const RemoveTaskItem& task) {
+    std::shared_ptr<BucketMetadata> bucket;
+    StorageObjectMetadata object;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        auto object_it = object_bucket_map_.find(task.key);
+        if (object_it == object_bucket_map_.end()) {
+            return MarkRemovedResult::kAlreadyRemoved;
+        }
+        if (object_it->second.object_version != task.object_version) {
+            return MarkRemovedResult::kStaleVersion;
+        }
+        auto bucket_it = buckets_.find(object_it->second.bucket_id);
+        if (bucket_it == buckets_.end()) {
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+        bool expected = false;
+        if (!bucket_it->second->mutating_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        bucket = bucket_it->second;
+        object = object_it->second;
+    }
+
+    auto clear_mutating = [&]() {
+        bucket->mutating_.store(false, std::memory_order_release);
+    };
+
+    auto updated = std::make_shared<BucketMetadata>(*bucket);
+    if (std::find(updated->tombstones.begin(), updated->tombstones.end(),
+                  task.key) != updated->tombstones.end()) {
+        clear_mutating();
+        return MarkRemovedResult::kAlreadyRemoved;
+    }
+    updated->tombstones.push_back(task.key);
+    std::sort(updated->tombstones.begin(), updated->tombstones.end());
+
+    // Durability precedes visibility: publish the tombstone before removing
+    // the key from the in-memory index or allowing an ACK.
+    auto persist = StoreBucketMetadataAtomically(object.bucket_id, updated);
+    if (!persist) {
+        clear_mutating();
+        return tl::make_unexpected(persist.error());
+    }
+
+    const int64_t deleted_size = object.key_size + object.data_size;
+    {
+        SharedMutexLocker lock(&mutex_);
+        auto object_it = object_bucket_map_.find(task.key);
+        auto bucket_it = buckets_.find(object.bucket_id);
+        if (object_it == object_bucket_map_.end()) {
+            clear_mutating();
+            return MarkRemovedResult::kAlreadyRemoved;
+        }
+        if (object_it->second.object_version != task.object_version ||
+            bucket_it == buckets_.end() || bucket_it->second != bucket) {
+            clear_mutating();
+            return MarkRemovedResult::kStaleVersion;
+        }
+        const int64_t old_meta_size = bucket->meta_size;
+        bucket->tombstones = std::move(updated->tombstones);
+        bucket->meta_size = updated->meta_size;
+        bucket->deleted_bytes_.fetch_add(deleted_size,
+                                         std::memory_order_relaxed);
+        total_size_ += bucket->meta_size - old_meta_size;
+        tombstoned_bytes_.fetch_add(deleted_size, std::memory_order_relaxed);
+        object_bucket_map_.erase(object_it);
+    }
+    clear_mutating();
+    LOG(INFO) << "Persisted LOCAL_DISK tombstone, task_id=" << task.task_id
+              << ", bucket_id=" << object.bucket_id
+              << ", bytes=" << deleted_size;
+    return MarkRemovedResult::kRemoved;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::CompactBucket(
+    int64_t bucket_id) {
+    std::shared_ptr<BucketMetadata> old_bucket;
+    std::vector<std::pair<std::string, BucketObjectMetadata>> live_entries;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+        old_bucket = bucket_it->second;
+        bool expected = false;
+        if (!old_bucket->mutating_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+    auto clear_mutating = [&]() {
+        old_bucket->mutating_.store(false, std::memory_order_release);
+    };
+
+    std::optional<BucketReadGuard> read_guard;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end() || bucket_it->second != old_bucket) {
+            clear_mutating();
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+        if (old_bucket->deleted_bytes_.load(std::memory_order_relaxed) == 0) {
+            clear_mutating();
+            return {};
+        }
+        std::unordered_set<std::string> tombstones(
+            old_bucket->tombstones.begin(), old_bucket->tombstones.end());
+        for (size_t i = 0; i < old_bucket->keys.size(); ++i) {
+            const auto& key = old_bucket->keys[i];
+            if (tombstones.contains(key)) continue;
+            auto object_it = object_bucket_map_.find(key);
+            if (object_it == object_bucket_map_.end() ||
+                object_it->second.bucket_id != bucket_id ||
+                object_it->second.object_version !=
+                    old_bucket->metadatas[i].object_version) {
+                continue;
+            }
+            live_entries.emplace_back(key, old_bucket->metadatas[i]);
+        }
+        read_guard.emplace(old_bucket);
+    }
+
+    auto wait_for_reads = [](const std::shared_ptr<BucketMetadata>& bucket) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (bucket->inflight_reads_.load(std::memory_order_acquire) > 0) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    };
+
+    if (live_entries.empty()) {
+        {
+            SharedMutexLocker lock(&mutex_);
+            auto old_it = buckets_.find(bucket_id);
+            if (old_it == buckets_.end() || old_it->second != old_bucket) {
+                clear_mutating();
+                return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+            }
+            for (const auto& key : old_bucket->keys) {
+                auto object_it = object_bucket_map_.find(key);
+                if (object_it != object_bucket_map_.end() &&
+                    object_it->second.bucket_id == bucket_id) {
+                    object_bucket_map_.erase(object_it);
+                }
+            }
+            lru_index_.erase(
+                {old_bucket->last_access_ns_.load(std::memory_order_relaxed),
+                 bucket_id});
+            buckets_.erase(old_it);
+            retired_buckets_[bucket_id] = old_bucket;
+        }
+        read_guard.reset();
+        clear_mutating();
+        if (!wait_for_reads(old_bucket)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        if (RemoveBucketFiles(bucket_id)) {
+            SharedMutexLocker lock(&mutex_);
+            auto retired = retired_buckets_.find(bucket_id);
+            if (retired != retired_buckets_.end()) {
+                total_size_ -= old_bucket->data_size + old_bucket->meta_size;
+                tombstoned_bytes_.fetch_sub(
+                    old_bucket->deleted_bytes_.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+                retired_buckets_.erase(retired);
+            }
+        } else {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
+    }
+
+    std::unordered_map<std::string, std::vector<char>> values;
+    std::unordered_map<std::string, UUID> versions;
+    auto old_path = GetBucketDataPath(bucket_id);
+    if (!old_path) {
+        clear_mutating();
+        return tl::make_unexpected(old_path.error());
+    }
+    auto old_file = OpenFile(old_path.value(), FileMode::Read);
+    if (!old_file) {
+        clear_mutating();
+        return tl::make_unexpected(old_file.error());
+    }
+    for (const auto& [key, metadata] : live_entries) {
+        auto& value = values[key];
+        value.resize(static_cast<size_t>(metadata.data_size));
+        iovec iov{value.data(), value.size()};
+        auto read = old_file.value()->vector_read(
+            &iov, 1, metadata.offset + metadata.key_size);
+        if (!read || read.value() != value.size()) {
+            clear_mutating();
+            return tl::make_unexpected(read ? ErrorCode::FILE_READ_FAIL
+                                            : read.error());
+        }
+        versions.emplace(key, metadata.object_version);
+    }
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    for (auto& [key, value] : values) {
+        batch[key].push_back(Slice{value.data(), value.size()});
+    }
+    const int64_t new_bucket_id = bucket_id_generator_->NextId();
+    std::vector<iovec> iovs;
+    std::vector<StorageObjectMetadata> new_objects;
+    auto build = BuildBucket(new_bucket_id, batch, iovs, new_objects);
+    if (!build) {
+        clear_mutating();
+        return tl::make_unexpected(build.error());
+    }
+    auto new_bucket = build.value();
+    new_bucket->compacted_from_bucket_id = bucket_id;
+    for (size_t i = 0; i < new_bucket->keys.size(); ++i) {
+        const UUID version = versions.at(new_bucket->keys[i]);
+        new_bucket->metadatas[i].object_version = version;
+        new_objects[i].object_version = version;
+    }
+    // Write durable data and a durable staging metadata file. The final .meta
+    // name is the commit record and must not exist before revalidation.
+    auto write = WriteBucket(new_bucket_id, new_bucket, iovs, false);
+    if (!write) {
+        CleanupOrphanedBucket(new_bucket_id);
+        clear_mutating();
+        return tl::make_unexpected(write.error());
+    }
+    auto staged_metadata = StageBucketMetadata(new_bucket_id, new_bucket);
+    if (!staged_metadata) {
+        CleanupOrphanedBucket(new_bucket_id);
+        clear_mutating();
+        return tl::make_unexpected(staged_metadata.error());
+    }
+    auto cleanup_staged = [&]() {
+        std::error_code ec;
+        std::filesystem::remove(staged_metadata.value(), ec);
+    };
+
+    {
+        SharedMutexLocker lock(&mutex_);
+        auto old_it = buckets_.find(bucket_id);
+        if (old_it == buckets_.end() || old_it->second != old_bucket) {
+            lock.unlock();
+            cleanup_staged();
+            CleanupOrphanedBucket(new_bucket_id);
+            clear_mutating();
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+        for (const auto& [key, metadata] : live_entries) {
+            auto object_it = object_bucket_map_.find(key);
+            if (object_it == object_bucket_map_.end() ||
+                object_it->second.bucket_id != bucket_id ||
+                object_it->second.object_version != metadata.object_version) {
+                lock.unlock();
+                cleanup_staged();
+                CleanupOrphanedBucket(new_bucket_id);
+                clear_mutating();
+                return tl::make_unexpected(
+                    ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+            }
+        }
+
+        // The atomic rename is the compaction commit point. Holding mutex_
+        // across the short publish prevents a Put of the same key from
+        // invalidating the just-checked incarnation before the commit record
+        // becomes visible after a crash.
+        auto publish =
+            PublishStagedBucketMetadata(new_bucket_id, staged_metadata.value());
+        if (!publish) {
+            lock.unlock();
+            cleanup_staged();
+            CleanupOrphanedBucket(new_bucket_id);
+            clear_mutating();
+            return tl::make_unexpected(publish.error());
+        }
+
+        total_size_ += new_bucket->data_size + new_bucket->meta_size;
+        for (size_t i = 0; i < new_bucket->keys.size(); ++i) {
+            object_bucket_map_[new_bucket->keys[i]] = new_objects[i];
+        }
+        buckets_.emplace(new_bucket_id, new_bucket);
+        lru_index_.emplace(0LL, new_bucket_id);
+        lru_index_.erase(
+            {old_bucket->last_access_ns_.load(std::memory_order_relaxed),
+             bucket_id});
+        buckets_.erase(old_it);
+        retired_buckets_[bucket_id] = old_bucket;
+    }
+    read_guard.reset();
+    clear_mutating();
+
+    if (!wait_for_reads(old_bucket)) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!RemoveBucketFiles(bucket_id)) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    {
+        SharedMutexLocker lock(&mutex_);
+        auto retired = retired_buckets_.find(bucket_id);
+        if (retired != retired_buckets_.end()) {
+            total_size_ -= old_bucket->data_size + old_bucket->meta_size;
+            tombstoned_bytes_.fetch_sub(
+                old_bucket->deleted_bytes_.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            retired_buckets_.erase(retired);
+        }
+    }
+    return {};
+}
+
+tl::expected<TombstoneGcResult, ErrorCode> BucketStorageBackend::RunTombstoneGC(
+    size_t max_buckets) {
+    TombstoneGcResult result;
+    RetryRetiredBucketDeletes(&result);
+    std::vector<int64_t> candidates;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        for (const auto& [bucket_id, bucket] : buckets_) {
+            if (candidates.size() >= max_buckets) break;
+            if (bucket->deleted_bytes_.load(std::memory_order_relaxed) > 0 &&
+                !bucket->mutating_.load(std::memory_order_acquire)) {
+                candidates.push_back(bucket_id);
+            }
+        }
+    }
+    for (const int64_t bucket_id : candidates) {
+        int64_t before = 0;
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            before = total_size_;
+        }
+        auto compact = CompactBucket(bucket_id);
+        if (!compact) {
+            if (compact.error() == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
+                compact.error() == ErrorCode::BUCKET_NOT_FOUND) {
+                continue;
+            }
+            return tl::make_unexpected(compact.error());
+        }
+        int64_t after = 0;
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            after = total_size_;
+        }
+        ++result.buckets_compacted;
+        result.physical_bytes_reclaimed += std::max<int64_t>(0, before - after);
+    }
+    return result;
+}
+
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
     // When eviction is enabled, always allow offloading since PrepareEviction
     // will manage capacity by evicting old buckets as needed.
@@ -2228,24 +2754,33 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
+        const std::unordered_set<std::string> tombstones(
+            bucket_it->second->tombstones.begin(),
+            bucket_it->second->tombstones.end());
+        const int64_t live_key_count = static_cast<int64_t>(std::count_if(
+            bucket_it->second->keys.begin(), bucket_it->second->keys.end(),
+            [&](const std::string& key) { return !tombstones.contains(key); }));
+        if (live_key_count > limit) {
             LOG(ERROR) << "Bucket key count exceeds limit: "
                        << "bucket_id=" << bucket_it->first
-                       << ", current_size=" << bucket_it->second->keys.size()
+                       << ", current_size=" << live_key_count
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
-        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
-            limit) {
+        if (live_key_count + static_cast<int64_t>(keys.size()) > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
         for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+            if (tombstones.contains(bucket_it->second->keys[i])) {
+                continue;
+            }
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
                 bucket_it->second->metadatas[i].key_size,
-                bucket_it->second->metadatas[i].data_size, ""});
+                bucket_it->second->metadatas[i].data_size, "",
+                bucket_it->second->metadatas[i].object_version});
         }
     }
     return 0;
@@ -2382,6 +2917,7 @@ BucketStorageBackend::BuildBucket(
             return tl::make_unexpected(ErrorCode::INVALID_KEY);
         }
         int64_t object_total_size = 0;
+        const UUID object_version = generate_uuid();
         iovs.emplace_back(
             iovec{const_cast<char*>(object.first.data()), object.first.size()});
         for (const auto& slice : object.second) {
@@ -2391,10 +2927,11 @@ BucketStorageBackend::BuildBucket(
         bucket->data_size += object_total_size + object.first.size();
         bucket->metadatas.emplace_back(BucketObjectMetadata{
             storage_offset, static_cast<int64_t>(object.first.size()),
-            object_total_size});
-        metadatas.emplace_back(StorageObjectMetadata{
-            bucket_id, storage_offset,
-            static_cast<int64_t>(object.first.size()), object_total_size, ""});
+            object_total_size, object_version});
+        metadatas.emplace_back(
+            StorageObjectMetadata{bucket_id, storage_offset,
+                                  static_cast<int64_t>(object.first.size()),
+                                  object_total_size, "", object_version});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
     }
@@ -2403,7 +2940,7 @@ BucketStorageBackend::BuildBucket(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-    std::vector<iovec>& iovs) {
+    std::vector<iovec>& iovs, bool publish_metadata) {
     namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id);
     if (!bucket_data_path_res) {
@@ -2519,6 +3056,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             file_cache_.erase(bucket_data_path);
         }
     }
+    // Flush the data file before publishing its metadata.  Opening the path
+    // again and fsyncing it also covers the POSIX vector-write path without
+    // widening StorageFile's virtual interface.
+    auto data_sync_result = FsyncPath(bucket_data_path);
+    if (!data_sync_result) {
+        return data_sync_result;
+    }
+    if (!publish_metadata) {
+        return {};
+    }
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
@@ -2577,6 +3124,67 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
                          << meta_path_res.value()
                          << ", error: " << ec.message();
         }
+    }
+}
+
+bool BucketStorageBackend::RemoveBucketFiles(int64_t bucket_id) {
+    namespace fs = std::filesystem;
+    bool success = true;
+    bool removed_any = false;
+    auto data_path = GetBucketDataPath(bucket_id);
+    if (data_path) {
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path.value());
+        }
+        std::error_code ec;
+        removed_any |= fs::remove(data_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "Failed to delete bucket data file "
+                       << data_path.value() << ": " << ec.message();
+            success = false;
+        }
+    }
+    auto meta_path = GetBucketMetadataPath(bucket_id);
+    if (meta_path) {
+        std::error_code ec;
+        removed_any |= fs::remove(meta_path.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "Failed to delete bucket metadata file "
+                       << meta_path.value() << ": " << ec.message();
+            success = false;
+        }
+    }
+    if (success && removed_any) {
+        auto sync = FsyncParentDirectory(data_path ? data_path.value()
+                                                   : meta_path.value());
+        success = sync.has_value();
+    }
+    return success;
+}
+
+void BucketStorageBackend::RetryRetiredBucketDeletes(
+    TombstoneGcResult* result) {
+    std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>> retired;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        retired.assign(retired_buckets_.begin(), retired_buckets_.end());
+    }
+    for (const auto& [bucket_id, bucket] : retired) {
+        if (bucket->inflight_reads_.load(std::memory_order_acquire) != 0 ||
+            !RemoveBucketFiles(bucket_id)) {
+            continue;
+        }
+        SharedMutexLocker lock(&mutex_);
+        auto it = retired_buckets_.find(bucket_id);
+        if (it == retired_buckets_.end() || it->second != bucket) continue;
+        const int64_t physical = bucket->data_size + bucket->meta_size;
+        total_size_ -= physical;
+        tombstoned_bytes_.fetch_sub(
+            bucket->deleted_bytes_.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        retired_buckets_.erase(it);
+        if (result) result->physical_bytes_reclaimed += physical;
     }
 }
 
@@ -2677,8 +3285,12 @@ BucketStorageBackend::SelectEvictionCandidate() {
     switch (bucket_backend_config_.eviction_policy) {
         case BucketEvictionPolicy::FIFO:
             // buckets_ is ordered by bucket_id (monotonically increasing),
-            // so begin() is always the oldest bucket.
-            return buckets_.begin();
+            // so the first non-mutating entry is the oldest safe candidate.
+            return std::find_if(buckets_.begin(), buckets_.end(),
+                                [](const auto& entry) {
+                                    return !entry.second->mutating_.load(
+                                        std::memory_order_acquire);
+                                });
 
         case BucketEvictionPolicy::LRU:
             // Use lru_index_ (a std::set ordered by {last_access_ns_,
@@ -2691,12 +3303,23 @@ BucketStorageBackend::SelectEvictionCandidate() {
             //     last_access_ns_, it is the true LRU candidate.
             //   - If stale, re-insert with the correct timestamp and retry.
             //   - If the bucket no longer exists, discard the entry.
-            while (!lru_index_.empty()) {
+            std::vector<std::pair<int64_t, int64_t>> deferred_busy;
+            size_t entries_to_check = lru_index_.size();
+            while (entries_to_check-- > 0 && !lru_index_.empty()) {
                 auto top_it = lru_index_.begin();
                 auto [ts, id] = *top_it;
                 auto bucket_it = buckets_.find(id);
                 if (bucket_it == buckets_.end()) {
                     lru_index_.erase(top_it);
+                    continue;
+                }
+                if (bucket_it->second->mutating_.load(
+                        std::memory_order_acquire)) {
+                    const int64_t actual_ts =
+                        bucket_it->second->last_access_ns_.load(
+                            std::memory_order_relaxed);
+                    lru_index_.erase(top_it);
+                    deferred_busy.emplace_back(actual_ts, id);
                     continue;
                 }
                 int64_t actual_ts = bucket_it->second->last_access_ns_.load(
@@ -2705,12 +3328,15 @@ BucketStorageBackend::SelectEvictionCandidate() {
                     // Correct entry: remove from index (bucket is about to be
                     // evicted) and return.
                     lru_index_.erase(top_it);
+                    lru_index_.insert(deferred_busy.begin(),
+                                      deferred_busy.end());
                     return bucket_it;
                 }
                 // Stale: repair and retry to find the true minimum.
                 lru_index_.erase(top_it);
                 lru_index_.emplace(actual_ts, id);
             }
+            lru_index_.insert(deferred_busy.begin(), deferred_busy.end());
             return buckets_.end();
 
         default:
@@ -2813,27 +3439,20 @@ BucketStorageBackend::PrepareEviction(
             std::move(evict_it->second);
         buckets_.erase(evict_it);
 
-        int64_t evicted_size = evict_meta->meta_size;
+        const int64_t evicted_size =
+            evict_meta->data_size + evict_meta->meta_size;
         // Remove all keys belonging to this bucket from the object map.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == evict_id) {
-                const int64_t object_size =
-                    obj_it->second.data_size + obj_it->second.key_size;
-                total_size_ -= object_size;
-                evicted_size += object_size;
                 object_bucket_map_.erase(obj_it);
+                pending_eviction_keys_.insert(key);
+                result.keys.push_back(key);
             }
         }
-        total_size_ -= evict_meta->meta_size;
+        total_size_ -= evicted_size;
         result.evicted_size += evicted_size;
-
-        // Collect for notification and file deletion.
-        for (const auto& key : evict_meta->keys) {
-            pending_eviction_keys_.insert(key);
-            result.keys.push_back(key);
-        }
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
             static_cast<uint64_t>(evict_meta->meta_size);
@@ -2882,12 +3501,20 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
         for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
             const auto& key = bucket_meta->keys[i];
             const auto& object_meta = bucket_meta->metadatas[i];
-            object_bucket_map_[key] = StorageObjectMetadata{
-                bucket_id, object_meta.offset, object_meta.key_size,
-                object_meta.data_size, ""};
-            total_size_ += object_meta.data_size + object_meta.key_size;
+            if (std::find(bucket_meta->tombstones.begin(),
+                          bucket_meta->tombstones.end(),
+                          key) != bucket_meta->tombstones.end()) {
+                continue;
+            }
+            object_bucket_map_[key] =
+                StorageObjectMetadata{bucket_id,
+                                      object_meta.offset,
+                                      object_meta.key_size,
+                                      object_meta.data_size,
+                                      "",
+                                      object_meta.object_version};
         }
-        total_size_ += bucket_meta->meta_size;
+        total_size_ += bucket_meta->data_size + bucket_meta->meta_size;
         if (bucket_backend_config_.eviction_policy ==
             BucketEvictionPolicy::LRU) {
             lru_index_.emplace(
@@ -2909,6 +3536,11 @@ void BucketStorageBackend::CommitPreparedEviction(
     pending_eviction_size_ -= pending.evicted_size;
     for (const auto& key : pending.keys) {
         pending_eviction_keys_.erase(key);
+    }
+    for (const auto& [_, bucket] : pending.buckets) {
+        tombstoned_bytes_.fetch_sub(
+            bucket->deleted_bytes_.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
     }
 }
 
@@ -3077,7 +3709,6 @@ BucketStorageBackend::EvictAboveDiskWatermark(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     int64_t bucket_id) {
-    namespace fs = std::filesystem;
     std::shared_ptr<BucketMetadata> bucket_metadata;
     std::vector<std::string> keys_to_remove;
 
@@ -3090,6 +3721,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
             LOG(WARNING) << "DeleteBucket: bucket not found, bucket_id="
                          << bucket_id;
             return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+        if (bucket_it->second->mutating_.load(std::memory_order_acquire)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
 
         // Move the shared_ptr out - we now own it
@@ -3105,14 +3740,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
-                    obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
-
-        // Subtract metadata size
-        total_size_ -= bucket_metadata->meta_size;
+        retired_buckets_[bucket_id] = bucket_metadata;
     }
     // Lock released - new readers can't find this bucket anymore
 
@@ -3145,27 +3776,21 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
         }
     }
 
-    // Step 3: Safe to delete files now - no readers are using them
-    std::error_code ec;
-
-    auto data_path_res = GetBucketDataPath(bucket_id);
-    if (data_path_res) {
-        fs::remove(data_path_res.value(), ec);
-        if (ec && ec != std::errc::no_such_file_or_directory) {
-            LOG(WARNING) << "DeleteBucket: failed to remove data file: "
-                         << data_path_res.value()
-                         << ", error: " << ec.message();
-        }
+    // Step 3: Safe to delete files now - no readers are using them. Physical
+    // accounting changes only after both files are gone.
+    if (!RemoveBucketFiles(bucket_id)) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-
-    auto meta_path_res = GetBucketMetadataPath(bucket_id);
-    if (meta_path_res) {
-        ec.clear();
-        fs::remove(meta_path_res.value(), ec);
-        if (ec && ec != std::errc::no_such_file_or_directory) {
-            LOG(WARNING) << "DeleteBucket: failed to remove metadata file: "
-                         << meta_path_res.value()
-                         << ", error: " << ec.message();
+    {
+        SharedMutexLocker lock(&mutex_);
+        auto retired = retired_buckets_.find(bucket_id);
+        if (retired != retired_buckets_.end()) {
+            total_size_ -=
+                bucket_metadata->data_size + bucket_metadata->meta_size;
+            tombstoned_bytes_.fetch_sub(
+                bucket_metadata->deleted_bytes_.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            retired_buckets_.erase(retired);
         }
     }
 
@@ -3176,34 +3801,45 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
+    return StoreBucketMetadataAtomically(id, std::move(metadata));
+}
+
+tl::expected<void, ErrorCode>
+BucketStorageBackend::StoreBucketMetadataAtomically(
+    int64_t id, std::shared_ptr<BucketMetadata> metadata) {
     auto meta_path_res = GetBucketMetadataPath(id);
     if (!meta_path_res) {
         LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    auto meta_path = meta_path_res.value();
-    auto open_file_result = OpenFile(meta_path, FileMode::Write);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-    auto file = std::move(open_file_result.value());
+    const auto& meta_path = meta_path_res.value();
     std::string str;
     struct_pb::to_pb(*metadata, str);
-    auto write_result = file->write(str, str.size());
+    auto write_result = AtomicWriteFile(meta_path, str);
     if (!write_result) {
-        LOG(ERROR) << "Write failed for: " << meta_path
-                   << ", error: " << write_result.error();
-        return tl::make_unexpected(write_result.error());
-    }
-    if (write_result.value() != str.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << meta_path
-                   << ", expected: " << str.size()
-                   << ", got: " << write_result.value();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return write_result;
     }
     metadata->meta_size = str.size();
     return {};
+}
+
+tl::expected<std::string, ErrorCode> BucketStorageBackend::StageBucketMetadata(
+    int64_t id, std::shared_ptr<BucketMetadata> metadata) {
+    auto meta_path = GetBucketMetadataPath(id);
+    if (!meta_path) return tl::make_unexpected(meta_path.error());
+    std::string contents;
+    struct_pb::to_pb(*metadata, contents);
+    auto staged = WriteDurableTempFile(meta_path.value(), contents);
+    if (!staged) return tl::make_unexpected(staged.error());
+    metadata->meta_size = contents.size();
+    return staged;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::PublishStagedBucketMetadata(
+    int64_t id, const std::string& staged_path) {
+    auto meta_path = GetBucketMetadataPath(id);
+    if (!meta_path) return tl::make_unexpected(meta_path.error());
+    return PublishDurableTempFile(staged_path, meta_path.value());
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(

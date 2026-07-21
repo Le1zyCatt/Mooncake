@@ -30,14 +30,21 @@ struct BucketObjectMetadata {
     int64_t offset;
     int64_t key_size;
     int64_t data_size;
+    UUID object_version{0, 0};
 };
-YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size, object_version);
 
 struct BucketMetadata {
     int64_t meta_size;
     int64_t data_size;
     std::vector<std::string> keys;
     std::vector<BucketObjectMetadata> metadatas;
+    // Persisted logical deletions.  A key listed here is never exposed by
+    // Init(), ScanMeta(), IsExist(), or BatchLoad().
+    std::vector<std::string> tombstones;
+    // A committed compaction output supersedes this source bucket.  Init uses
+    // the marker on the new bucket to finish a crash-interrupted publish.
+    int64_t compacted_from_bucket_id{-1};
 
     // Runtime-only fields (not serialized) for safe deletion support
     // Tracks number of in-flight reads to enable safe bucket deletion
@@ -45,6 +52,9 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    mutable std::atomic<int64_t> deleted_bytes_{0};
+    // Serializes tombstone/compaction mutation. Eviction skips busy buckets.
+    mutable std::atomic<bool> mutating_{false};
 
     // Default constructor
     BucketMetadata() = default;
@@ -55,8 +65,12 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(other.keys),
           metadatas(other.metadatas),
+          tombstones(other.tombstones),
+          compacted_from_bucket_id(other.compacted_from_bucket_id),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          deleted_bytes_(other.deleted_bytes_.load()),
+          mutating_(false) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -64,8 +78,12 @@ struct BucketMetadata {
           data_size(other.data_size),
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
+          tombstones(std::move(other.tombstones)),
+          compacted_from_bucket_id(other.compacted_from_bucket_id),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          deleted_bytes_(other.deleted_bytes_.load()),
+          mutating_(false) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -74,6 +92,9 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = other.keys;
             metadatas = other.metadatas;
+            tombstones = other.tombstones;
+            compacted_from_bucket_id = other.compacted_from_bucket_id;
+            deleted_bytes_.store(other.deleted_bytes_.load());
             // Don't copy runtime state
         }
         return *this;
@@ -86,12 +107,27 @@ struct BucketMetadata {
             data_size = other.data_size;
             keys = std::move(other.keys);
             metadatas = std::move(other.metadatas);
+            tombstones = std::move(other.tombstones);
+            compacted_from_bucket_id = other.compacted_from_bucket_id;
+            deleted_bytes_.store(other.deleted_bytes_.load());
             // Don't move runtime state
         }
         return *this;
     }
 };
-YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+YLT_REFL(BucketMetadata, data_size, keys, metadatas, tombstones,
+         compacted_from_bucket_id);
+
+enum class MarkRemovedResult {
+    kRemoved,
+    kAlreadyRemoved,
+    kStaleVersion,
+};
+
+struct TombstoneGcResult {
+    size_t buckets_compacted{0};
+    int64_t physical_bytes_reclaimed{0};
+};
 
 /**
  * @brief RAII guard for tracking in-flight bucket reads.
@@ -340,6 +376,16 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    virtual tl::expected<MarkRemovedResult, ErrorCode> MarkRemoved(
+        const RemoveTaskItem& /* task */) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+
+    virtual tl::expected<TombstoneGcResult, ErrorCode> RunTombstoneGC(
+        size_t /* max_buckets */ = 1) {
+        return TombstoneGcResult{};
     }
 
     FileStorageConfig file_storage_config_;
@@ -913,6 +959,18 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    tl::expected<MarkRemovedResult, ErrorCode> MarkRemoved(
+        const RemoveTaskItem& task) override;
+
+    tl::expected<TombstoneGcResult, ErrorCode> RunTombstoneGC(
+        size_t max_buckets = 1) override;
+
+    tl::expected<void, ErrorCode> CompactBucket(int64_t bucket_id);
+
+    int64_t GetTombstonedBytes() const {
+        return tombstoned_bytes_.load(std::memory_order_relaxed);
+    }
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
@@ -922,10 +980,19 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
-        std::vector<iovec>& iovs);
+        std::vector<iovec>& iovs, bool publish_metadata = true);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> StoreBucketMetadataAtomically(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<std::string, ErrorCode> StageBucketMetadata(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> PublishStagedBucketMetadata(
+        int64_t bucket_id, const std::string& staged_path);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
@@ -957,6 +1024,10 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param bucket_id The bucket ID whose files should be deleted.
      */
     void CleanupOrphanedBucket(int64_t bucket_id);
+
+    bool RemoveBucketFiles(int64_t bucket_id);
+
+    void RetryRetiredBucketDeletes(TombstoneGcResult* result);
 
     /**
      * @brief Rollback a committed bucket from the local index when
@@ -1072,12 +1143,15 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    std::atomic<int64_t> tombstoned_bytes_{0};
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_write_keys_;
     int64_t pending_eviction_size_ GUARDED_BY(mutex_) = 0;
     int64_t pending_write_size_ GUARDED_BY(mutex_) = 0;
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(mutex_)
+        retired_buckets_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     // LRU eviction index: ordered set of {last_access_ns_, bucket_id}.
