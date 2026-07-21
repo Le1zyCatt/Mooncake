@@ -129,6 +129,7 @@ class UbBufferManager final {
 
     Status addBufferInternal(BufferDesc& desc, const MemoryOptions& options);
     Status unregisterRecord(LocalRecord& record);
+    void retainPendingRecord(LocalRecord& record);
     static uint32_t segmentAccess(Permission permission);
     static bool permissionAllows(Permission permission, Request::OpCode opcode);
     UbContextPtr findContext(Topology::NicID topology_id) const;
@@ -139,9 +140,16 @@ class UbBufferManager final {
 
     mutable std::shared_mutex local_mutex_;
     std::map<AddressRange, LocalRecord> local_buffers_;
+    // Registrations created by an add/transaction rollback stay owned here
+    // when the provider refuses the first unregister attempt. clear() retries
+    // them before the manager can be destroyed.
+    std::vector<LocalSegmentPtr> pending_local_segments_;
 
     mutable std::shared_mutex import_mutex_;
     std::unordered_map<ImportKey, RemoteSegmentPtr, ImportKeyHash> imports_;
+    // Partial imports returned alongside a provider error have no usable cache
+    // key, but still need stable ownership until unimport succeeds.
+    std::vector<RemoteSegmentPtr> pending_remote_segments_;
     std::atomic<uint64_t> next_generation_{1};
 };
 

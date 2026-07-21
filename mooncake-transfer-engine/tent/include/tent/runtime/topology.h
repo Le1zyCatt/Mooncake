@@ -36,7 +36,7 @@ namespace tent {
 class Platform;
 class Topology {
    public:
-    const static size_t DevicePriorityRanks = 3;
+    inline static constexpr size_t DevicePriorityRanks = 3;
 
     // Keep the existing RDMA/TCP numeric values stable for serialized
     // topologies. UB is a distinct link type and must never be selected as an

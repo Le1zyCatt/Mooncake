@@ -112,7 +112,10 @@ class RailMonitor {
                        uint64_t latency_ns, uint64_t now_ns = 0);
     void recordError(const UbPostPath& path, uint64_t now_ns = 0);
     void recordTimeout(const UbPostPath& path, uint64_t now_ns = 0);
-    void recordEndpointRebuild(const UbPostPath& path, uint64_t now_ns = 0);
+    // Records at most one rebuild for each endpoint generation on a physical
+    // rail. Returns true when telemetry advanced, allowing EndpointStore to
+    // call this safely from converging/retried rebuild paths.
+    bool recordEndpointRebuild(const UbPostPath& path, uint64_t now_ns = 0);
 
     [[nodiscard]] RailStats stats(const UbPostPath& path, uint64_t now_ns = 0);
     [[nodiscard]] std::vector<RailStats> allStats(uint64_t now_ns = 0);
@@ -132,6 +135,10 @@ class RailMonitor {
         // Late errors at or before a completed recovery epoch must not
         // resurrect an already-expired pause.
         uint64_t ignore_errors_through_ns{0};
+        // Endpoint generations are process-wide monotonic. Keep a separate
+        // watermark from latest_endpoint_generation because path registration
+        // may observe the replacement before rebuild telemetry is emitted.
+        uint64_t recorded_rebuild_generation{0};
     };
 
     using RailMap = std::unordered_map<UbRailKey, RailState, UbRailKeyHash>;

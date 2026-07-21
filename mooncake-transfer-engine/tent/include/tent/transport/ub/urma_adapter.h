@@ -71,9 +71,9 @@ struct SegmentDescriptor {
 };
 
 // Native handles never escape through this interface. Concrete adapters own
-// their raw handles and release them from their destructors. All typed handles
-// are reference counted so slices can retain segments until their completion
-// has been consumed.
+// their raw handles and make explicit release operations retryable. All typed
+// handles are reference counted so slices can retain segments until their
+// completion has been consumed.
 class OpaqueHandle {
    public:
     OpaqueHandle() = default;
@@ -219,9 +219,11 @@ class UrmaAdapter {
 
     virtual Status openContext(const DeviceInfo& device,
                                ContextPtr& context) = 0;
-    // close/delete/unregister/unimport reset the caller's shared_ptr. Native
-    // destruction is safely deferred while another owner still retains it;
-    // calling any of these methods again with a null handle is successful.
+    // close/delete/unregister/unimport reset the caller's shared_ptr only after
+    // the provider has released the native resource. If another owner still
+    // retains the handle, or if the provider returns busy/error, the operation
+    // fails and leaves the shared_ptr intact for a later retry. Calling any of
+    // these methods again with a null handle is successful.
     virtual Status closeContext(ContextPtr& context) = 0;
 
     virtual Status createJfc(const ContextPtr& context,

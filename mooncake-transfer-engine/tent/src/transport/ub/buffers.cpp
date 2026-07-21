@@ -251,7 +251,12 @@ Status UbBufferManager::addBufferInternal(BufferDesc& desc,
                                                      desc.addr, desc.length,
                                                      segment_options, segment);
         if (!status.ok()) {
+            if (segment) {
+                record.segments.emplace(context->topologyId(),
+                                        std::move(segment));
+            }
             (void)unregisterRecord(record);
+            retainPendingRecord(record);
             return status;
         }
         metadata.segments.push_back(UbBufferSegmentMetadata{
@@ -270,6 +275,7 @@ Status UbBufferManager::addBufferInternal(BufferDesc& desc,
     auto status = encodeBufferMetadata(metadata, encoded);
     if (!status.ok()) {
         (void)unregisterRecord(record);
+        retainPendingRecord(record);
         return status;
     }
 
@@ -283,6 +289,7 @@ Status UbBufferManager::addBufferInternal(BufferDesc& desc,
                  range.base)) {
             lock.unlock();
             (void)unregisterRecord(record);
+            retainPendingRecord(record);
             return Status::InvalidArgument(
                 "Overlapping UB buffer registration" LOC_MARK);
         }
@@ -320,53 +327,132 @@ Status UbBufferManager::addBuffers(std::vector<BufferDesc>& descs,
 
 Status UbBufferManager::unregisterRecord(LocalRecord& record) {
     Status first_error = Status::OK();
-    for (auto& [_, segment] : record.segments) {
-        auto status = adapter_->unregisterLocalSegment(segment);
-        if (!status.ok() && first_error.ok()) first_error = status;
+    for (auto it = record.segments.begin(); it != record.segments.end();) {
+        auto status = adapter_->unregisterLocalSegment(it->second);
+        if (!status.ok()) {
+            if (first_error.ok()) first_error = status;
+            ++it;
+            continue;
+        }
+        if (it->second) {
+            if (first_error.ok()) {
+                first_error = Status::InternalError(
+                    "URMA adapter retained a local segment after successful "
+                    "unregister" LOC_MARK);
+            }
+            ++it;
+            continue;
+        }
+        it = record.segments.erase(it);
     }
-    record.segments.clear();
     return first_error;
 }
 
+void UbBufferManager::retainPendingRecord(LocalRecord& record) {
+    if (record.segments.empty()) return;
+    std::unique_lock<std::shared_mutex> lock(local_mutex_);
+    for (auto& [_, segment] : record.segments) {
+        if (segment) pending_local_segments_.push_back(std::move(segment));
+    }
+    record.segments.clear();
+}
+
 Status UbBufferManager::removeBuffer(BufferDesc& desc) {
-    LocalRecord record;
-    bool found = false;
+    Status status = Status::OK();
+    bool removed = false;
     {
         std::unique_lock<std::shared_mutex> lock(local_mutex_);
         auto it = local_buffers_.find(AddressRange{desc.addr, desc.length});
         if (it != local_buffers_.end()) {
-            record = std::move(it->second);
-            local_buffers_.erase(it);
-            found = true;
+            status = unregisterRecord(it->second);
+            if (status.ok() && it->second.segments.empty()) {
+                local_buffers_.erase(it);
+                removed = true;
+            }
+        } else {
+            // Idempotent retry after a previously successful removal.
+            removed = true;
         }
+    }
+    if (!status.ok()) return status;
+    if (!removed) {
+        return Status::InternalError(
+            "UB local record still owns segments after unregister" LOC_MARK);
     }
     desc.transport_attrs.erase(TransportType::UB);
     desc.transports.erase(std::remove(desc.transports.begin(),
                                       desc.transports.end(), TransportType::UB),
                           desc.transports.end());
-    return found ? unregisterRecord(record) : Status::OK();
+    return Status::OK();
 }
 
 Status UbBufferManager::clear() {
-    std::map<AddressRange, LocalRecord> locals;
+    Status first_error = Status::OK();
     {
         std::unique_lock<std::shared_mutex> lock(local_mutex_);
-        locals.swap(local_buffers_);
-    }
-    Status first_error = Status::OK();
-    for (auto& [_, record] : locals) {
-        auto status = unregisterRecord(record);
-        if (!status.ok() && first_error.ok()) first_error = status;
+        for (auto it = local_buffers_.begin(); it != local_buffers_.end();) {
+            auto status = unregisterRecord(it->second);
+            if (!status.ok() && first_error.ok()) first_error = status;
+            if (status.ok() && it->second.segments.empty()) {
+                it = local_buffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = pending_local_segments_.begin();
+             it != pending_local_segments_.end();) {
+            auto status = adapter_->unregisterLocalSegment(*it);
+            if (!status.ok()) {
+                if (first_error.ok()) first_error = status;
+                ++it;
+            } else if (*it) {
+                if (first_error.ok()) {
+                    first_error = Status::InternalError(
+                        "URMA adapter retained a pending local segment after "
+                        "successful unregister" LOC_MARK);
+                }
+                ++it;
+            } else {
+                it = pending_local_segments_.erase(it);
+            }
+        }
     }
 
-    std::unordered_map<ImportKey, RemoteSegmentPtr, ImportKeyHash> imports;
     {
         std::unique_lock<std::shared_mutex> lock(import_mutex_);
-        imports.swap(imports_);
-    }
-    for (auto& [_, segment] : imports) {
-        auto status = adapter_->unimportRemoteSegment(segment);
-        if (!status.ok() && first_error.ok()) first_error = status;
+        for (auto it = imports_.begin(); it != imports_.end();) {
+            auto status = adapter_->unimportRemoteSegment(it->second);
+            if (!status.ok()) {
+                if (first_error.ok()) first_error = status;
+                ++it;
+            } else if (it->second) {
+                if (first_error.ok()) {
+                    first_error = Status::InternalError(
+                        "URMA adapter retained a remote segment after "
+                        "successful unimport" LOC_MARK);
+                }
+                ++it;
+            } else {
+                it = imports_.erase(it);
+            }
+        }
+        for (auto it = pending_remote_segments_.begin();
+             it != pending_remote_segments_.end();) {
+            auto status = adapter_->unimportRemoteSegment(*it);
+            if (!status.ok()) {
+                if (first_error.ok()) first_error = status;
+                ++it;
+            } else if (*it) {
+                if (first_error.ok()) {
+                    first_error = Status::InternalError(
+                        "URMA adapter retained a pending remote segment after "
+                        "successful unimport" LOC_MARK);
+                }
+                ++it;
+            } else {
+                it = pending_remote_segments_.erase(it);
+            }
+        }
     }
     return first_error;
 }
@@ -446,46 +532,65 @@ Status UbBufferManager::importRemote(SegmentID remote_segment_id,
 
     ImportKey key{local_topology_id, remote_segment_id, remote_topology_id,
                   metadata.base, metadata.generation};
-    {
-        std::shared_lock<std::shared_mutex> lock(import_mutex_);
-        auto it = imports_.find(key);
-        if (it != imports_.end()) {
-            result = ImportedSegmentRef{
-                context,       it->second,      metadata.generation,
-                metadata.base, metadata.length, remote_topology_id};
-            return Status::OK();
-        }
-    }
-
     RemoteSegmentPtr imported;
-    SegmentOptions options;
-    options.access = segmentAccess(metadata.permission);
-    CHECK_STATUS(adapter_->importRemoteSegment(
-        context->handle(), descriptor->descriptor, options, imported));
-
-    std::vector<RemoteSegmentPtr> stale;
     {
+        // Serialize the provider import with the second cache lookup. This
+        // avoids creating a duplicate handle that has no cache key capable of
+        // retaining it when an immediate rollback fails.
         std::unique_lock<std::shared_mutex> lock(import_mutex_);
-        auto [it, inserted] = imports_.emplace(key, imported);
-        if (!inserted) {
-            stale.push_back(std::move(imported));
-            imported = it->second;
+        auto current = imports_.find(key);
+        if (current == imports_.end()) {
+            SegmentOptions options;
+            options.access = segmentAccess(metadata.permission);
+            auto import_status = adapter_->importRemoteSegment(
+                context->handle(), descriptor->descriptor, options, imported);
+            if (!import_status.ok()) {
+                if (imported) {
+                    (void)adapter_->unimportRemoteSegment(imported);
+                    if (imported) {
+                        pending_remote_segments_.push_back(std::move(imported));
+                    }
+                }
+                return import_status;
+            }
+            if (!imported) {
+                return Status::InternalError(
+                    "URMA adapter returned no remote segment after successful "
+                    "import" LOC_MARK);
+            }
+            current = imports_.emplace(key, imported).first;
+        } else {
+            imported = current->second;
         }
+
         for (auto iter = imports_.begin(); iter != imports_.end();) {
             const auto& candidate = iter->first;
-            if (candidate.local_topology_id == local_topology_id &&
+            const bool stale =
+                candidate.local_topology_id == local_topology_id &&
                 candidate.remote_segment_id == remote_segment_id &&
                 candidate.remote_topology_id == remote_topology_id &&
                 candidate.buffer_base == metadata.base &&
-                candidate.generation != metadata.generation) {
-                stale.push_back(std::move(iter->second));
-                iter = imports_.erase(iter);
-            } else {
+                candidate.generation != metadata.generation;
+            if (!stale) {
                 ++iter;
+                continue;
+            }
+            auto status = adapter_->unimportRemoteSegment(iter->second);
+            if (!status.ok()) {
+                // The old generation may still be retained by an in-flight
+                // WR. Keep it cached for a later import/clear retry, but do
+                // not fail the current request after its new generation was
+                // imported successfully.
+                ++iter;
+            } else if (iter->second) {
+                // Treat an adapter that reports success without releasing the
+                // handle conservatively: retain ownership and retry later.
+                ++iter;
+            } else {
+                iter = imports_.erase(iter);
             }
         }
     }
-    for (auto& old : stale) (void)adapter_->unimportRemoteSegment(old);
     result =
         ImportedSegmentRef{context,       imported,        metadata.generation,
                            metadata.base, metadata.length, remote_topology_id};

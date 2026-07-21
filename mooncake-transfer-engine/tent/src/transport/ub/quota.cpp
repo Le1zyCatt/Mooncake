@@ -64,14 +64,16 @@ bool QuotaManager::setPathLimits(const UbPostPath& path,
                                  const QuotaLimits& limits) {
     if (!path.valid()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    paths_[path].override_limits = limits;
+    auto& record = paths_[UbRailKey::fromPath(path)];
+    record.latest_path = path;
+    record.override_limits = limits;
     return true;
 }
 
 bool QuotaManager::clearPathLimits(const UbPostPath& path) {
     if (!path.valid()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
-    auto it = paths_.find(path);
+    auto it = paths_.find(UbRailKey::fromPath(path));
     if (it == paths_.end() || !it->second.override_limits) return false;
     it->second.override_limits.reset();
     return true;
@@ -81,14 +83,45 @@ std::optional<QuotaReservation> QuotaManager::tryAcquire(const UbPostPath& path,
                                                          uint64_t bytes,
                                                          uint64_t wrs) {
     std::lock_guard<std::mutex> lock(mutex_);
+    return tryAcquireLocked(path, bytes, wrs, true);
+}
+
+std::optional<QuotaReservation> QuotaManager::tryAcquireFirst(
+    const std::vector<UbPostPath>& paths, uint64_t bytes, uint64_t wrs) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& path : paths) {
+        auto reservation = tryAcquireLocked(path, bytes, wrs, false);
+        if (reservation) return reservation;
+    }
+    aggregate_stats_.rejected_acquisitions =
+        saturatingAdd(aggregate_stats_.rejected_acquisitions, 1);
+    return std::nullopt;
+}
+
+QuotaAvailability QuotaManager::availability(const UbPostPath& path,
+                                             uint64_t bytes,
+                                             uint64_t wrs) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return availabilityLocked(path, bytes, wrs);
+}
+
+std::optional<QuotaReservation> QuotaManager::tryAcquireLocked(
+    const UbPostPath& path, uint64_t bytes, uint64_t wrs,
+    bool count_aggregate_reject) {
     if (!path.valid() || wrs == 0) {
-        aggregate_stats_.rejected_acquisitions =
-            saturatingAdd(aggregate_stats_.rejected_acquisitions, 1);
+        if (count_aggregate_reject) {
+            aggregate_stats_.rejected_acquisitions =
+                saturatingAdd(aggregate_stats_.rejected_acquisitions, 1);
+        }
         return std::nullopt;
     }
 
     auto& device = devices_[path.local_topology_id];
-    auto& rail = paths_[path];
+    auto& rail = paths_[UbRailKey::fromPath(path)];
+    if (!rail.latest_path.valid() ||
+        path.endpoint_generation > rail.latest_path.endpoint_generation) {
+        rail.latest_path = path;
+    }
     const auto device_limits = effectiveLimits(device, default_device_limits_);
     const auto path_limits = effectiveLimits(rail, default_path_limits_);
     const bool device_fits = fits(device.usage.inflight_bytes, bytes,
@@ -108,8 +141,10 @@ std::optional<QuotaReservation> QuotaManager::tryAcquire(const UbPostPath& path,
             rail.rejected_acquisitions =
                 saturatingAdd(rail.rejected_acquisitions, 1);
         }
-        aggregate_stats_.rejected_acquisitions =
-            saturatingAdd(aggregate_stats_.rejected_acquisitions, 1);
+        if (count_aggregate_reject) {
+            aggregate_stats_.rejected_acquisitions =
+                saturatingAdd(aggregate_stats_.rejected_acquisitions, 1);
+        }
         return std::nullopt;
     }
 
@@ -128,6 +163,42 @@ std::optional<QuotaReservation> QuotaManager::tryAcquire(const UbPostPath& path,
     active_reservations_.emplace(id, ActiveReservation{path, bytes, wrs});
     aggregate_stats_.active_reservations = active_reservations_.size();
     return QuotaReservation{id, path, bytes, wrs};
+}
+
+QuotaAvailability QuotaManager::availabilityLocked(const UbPostPath& path,
+                                                   uint64_t bytes,
+                                                   uint64_t wrs) const {
+    if (!path.valid() || wrs == 0) return {};
+
+    const auto device_it = devices_.find(path.local_topology_id);
+    const auto path_it = paths_.find(UbRailKey::fromPath(path));
+    const QuotaRecord empty;
+    const auto& device =
+        device_it == devices_.end() ? empty : device_it->second;
+    const auto& rail = path_it == paths_.end() ? empty : path_it->second;
+    const auto device_limits = effectiveLimits(device, default_device_limits_);
+    const auto path_limits = effectiveLimits(rail, default_path_limits_);
+
+    QuotaAvailability result;
+    result.can_acquire =
+        fits(device.usage.inflight_bytes, bytes,
+             device_limits.max_inflight_bytes) &&
+        fits(device.usage.outstanding_wrs, wrs,
+             device_limits.max_outstanding_wrs) &&
+        fits(rail.usage.inflight_bytes, bytes,
+             path_limits.max_inflight_bytes) &&
+        fits(rail.usage.outstanding_wrs, wrs, path_limits.max_outstanding_wrs);
+    result.normalized_inflight =
+        std::max(normalizedUsage(device.usage.inflight_bytes, bytes,
+                                 device_limits.max_inflight_bytes),
+                 normalizedUsage(rail.usage.inflight_bytes, bytes,
+                                 path_limits.max_inflight_bytes));
+    result.normalized_outstanding_wrs =
+        std::max(normalizedUsage(device.usage.outstanding_wrs, wrs,
+                                 device_limits.max_outstanding_wrs),
+                 normalizedUsage(rail.usage.outstanding_wrs, wrs,
+                                 path_limits.max_outstanding_wrs));
+    return result;
 }
 
 bool QuotaManager::release(const QuotaReservation& reservation) {
@@ -150,7 +221,7 @@ bool QuotaManager::release(const QuotaReservation& reservation) {
         device->second.total_releases =
             saturatingAdd(device->second.total_releases, 1);
     }
-    auto path = paths_.find(charge.path);
+    auto path = paths_.find(UbRailKey::fromPath(charge.path));
     if (path != paths_.end()) {
         releaseUsage(path->second.usage, charge.bytes, charge.wrs);
         path->second.total_releases =
@@ -183,7 +254,7 @@ PathQuotaStats QuotaManager::pathStats(const UbPostPath& path) const {
     std::lock_guard<std::mutex> lock(mutex_);
     PathQuotaStats result;
     result.path = path;
-    auto it = paths_.find(path);
+    auto it = paths_.find(UbRailKey::fromPath(path));
     if (it == paths_.end()) {
         static_cast<QuotaStats&>(result).limits = default_path_limits_;
     } else {
@@ -211,11 +282,11 @@ std::vector<PathQuotaStats> QuotaManager::allPathStats() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<PathQuotaStats> result;
     result.reserve(paths_.size());
-    for (const auto& [path, record] : paths_) {
+    for (const auto& [_, record] : paths_) {
         PathQuotaStats stats;
         static_cast<QuotaStats&>(stats) =
             makeStats(record, default_path_limits_);
-        stats.path = path;
+        stats.path = record.latest_path;
         result.push_back(stats);
     }
     return result;
@@ -233,6 +304,16 @@ size_t QuotaManager::activeReservationCount() const {
 
 bool QuotaManager::fits(uint64_t current, uint64_t charge, uint64_t limit) {
     return current <= limit && charge <= limit - current;
+}
+
+double QuotaManager::normalizedUsage(uint64_t current, uint64_t charge,
+                                     uint64_t limit) {
+    if (limit == std::numeric_limits<uint64_t>::max()) return 0.0;
+    if (limit == 0) return current == 0 && charge == 0 ? 0.0 : 1.0;
+    const long double projected = std::min<long double>(
+        static_cast<long double>(limit),
+        static_cast<long double>(current) + static_cast<long double>(charge));
+    return static_cast<double>(projected / static_cast<long double>(limit));
 }
 
 uint64_t QuotaManager::saturatingAdd(uint64_t lhs, uint64_t rhs) {

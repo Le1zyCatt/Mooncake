@@ -209,6 +209,13 @@ struct UbTransport::Impl {
                 static_cast<Topology::NicID>(id), found->second, adapter);
             status = context->initialize(params.jfc_per_context, jfc_options);
             if (!status.ok()) {
+                if (context->state() == ub::UbContext::State::kDraining) {
+                    // Initialization produced a native handle whose cleanup
+                    // also failed. Adopt it into the transport graph and abort
+                    // installation so uninstall can retry without a leak.
+                    contexts.push_back(std::move(context));
+                    return failInstall(status);
+                }
                 LOG(WARNING) << "Disable UB device " << nic->name << ": "
                              << status.ToString();
                 continue;
@@ -309,6 +316,14 @@ struct UbTransport::Impl {
             },
             [this](const std::shared_ptr<ub::UbEndpoint>& endpoint) {
                 if (endpoints) (void)endpoints->retire(endpoint);
+            },
+            [this](Topology::NicID local_topology_id) {
+                if (!endpoints) {
+                    return Status::InternalError(
+                        "UB endpoint store is unavailable during device "
+                        "failure cleanup" LOC_MARK);
+                }
+                return endpoints->retireLocalDevice(local_topology_id);
             });
         status = workers->start();
         if (!status.ok()) return failInstall(status);
@@ -330,10 +345,6 @@ struct UbTransport::Impl {
     Status shutdownUnlocked() {
         installed.store(false, std::memory_order_release);
         shutting_down.store(true, std::memory_order_release);
-        Status first_error = Status::OK();
-        auto remember = [&first_error](const Status& status) {
-            if (first_error.ok() && !status.ok()) first_error = status;
-        };
 
         // Callback replacement waits for a currently executing UB bootstrap
         // handler, fencing all control-plane access before resources retire.
@@ -363,7 +374,15 @@ struct UbTransport::Impl {
             buffers.reset();
         }
         for (auto it = contexts.rbegin(); it != contexts.rend(); ++it) {
-            if (*it) remember((*it)->shutdown());
+            if (!*it) continue;
+            auto status = (*it)->shutdown();
+            if (!status.ok()) {
+                // Keep the entire context vector and both lookup maps until
+                // every JFC and Context has been released. Some contexts may
+                // already be closed, but their idempotent shutdown keeps the
+                // ownership graph intact while the failed handle is retried.
+                return status;
+            }
         }
         contexts.clear();
         context_by_topology_id.clear();
@@ -371,15 +390,25 @@ struct UbTransport::Impl {
         rails.reset();
         quota.reset();
         if (adapter_initialized && adapter) {
-            remember(adapter->shutdown());
+            auto status = adapter->shutdown();
+            if (!status.ok()) {
+                // A failed provider shutdown remains an initialized adapter
+                // for lifecycle purposes. Do not permit reinstall or discard
+                // it; a later uninstall retries the provider operation.
+                return status;
+            }
             adapter_initialized = false;
         }
         metadata.reset();
         local_topology.reset();
         conf.reset();
         local_segment_name.clear();
+        {
+            std::lock_guard<std::mutex> lock(endpoint_generation_mutex);
+            ready_endpoint_generations.clear();
+        }
         shutting_down.store(false, std::memory_order_release);
-        return first_error;
+        return Status::OK();
     }
 
     Status publishLocalDevices() {
@@ -416,6 +445,25 @@ struct UbTransport::Impl {
                 return Status::OK();
             }));
         return manager.synchronizeLocal();
+    }
+
+    void recordReadyEndpoint(const std::shared_ptr<ub::UbEndpoint>& endpoint) {
+        if (!endpoint || !endpoint->ready() || !rails) return;
+
+        const auto generation = endpoint->generation();
+        const auto& key = endpoint->key();
+        std::lock_guard<std::mutex> lock(endpoint_generation_mutex);
+        auto [it, inserted] =
+            ready_endpoint_generations.emplace(key, generation);
+        if (!inserted && generation > it->second) {
+            // Serialize the generation watermark with telemetry so a delayed
+            // callback for an older incarnation can neither roll the map back
+            // nor race a newer rebuild into a double count.
+            it->second = generation;
+            rails->recordEndpointRebuild(
+                ub::UbPostPath{key.local_topology_id, key.remote_segment_id,
+                               key.remote_topology_id, generation});
+        }
     }
 
     Status resolveEndpoint(const ub::EndpointResolveRequest& request,
@@ -457,6 +505,7 @@ struct UbTransport::Impl {
                     "Remote UB endpoint lacks required receiver-credit "
                     "support" LOC_MARK);
             }
+            recordReadyEndpoint(endpoint);
             return Status::OK();
         }
 
@@ -492,6 +541,7 @@ struct UbTransport::Impl {
             endpoint.reset();
             return status;
         }
+        recordReadyEndpoint(endpoint);
         return Status::OK();
     }
 
@@ -535,6 +585,7 @@ struct UbTransport::Impl {
         }
         if (status.ok()) {
             bindReceiverCreditIdentity(local_segment.get(), response);
+            recordReadyEndpoint(endpoint);
         }
         if (!status.ok()) {
             if (endpoint) (void)endpoints->retire(endpoint);
@@ -553,6 +604,7 @@ struct UbTransport::Impl {
     }
 
     mutable std::mutex lifecycle_mutex;
+    mutable std::mutex endpoint_generation_mutex;
     std::shared_ptr<ub::UrmaAdapter> adapter;
     bool adapter_initialized{false};
     bool callback_installed{false};
@@ -573,6 +625,8 @@ struct UbTransport::Impl {
     std::unique_ptr<ub::RailMonitor> rails;
     std::unique_ptr<ub::QuotaManager> quota;
     std::unique_ptr<ub::UbWorkers> workers;
+    std::unordered_map<ub::UbEndpointKey, uint64_t, ub::UbEndpointKeyHash>
+        ready_endpoint_generations;
 };
 
 UbTransport::UbTransport(std::shared_ptr<ub::UrmaAdapter> adapter)

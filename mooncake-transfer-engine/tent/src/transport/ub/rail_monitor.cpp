@@ -107,15 +107,20 @@ void RailMonitor::recordTimeout(const UbPostPath& path, uint64_t now_ns) {
     recordFailureLocked(path, now_ns, true);
 }
 
-void RailMonitor::recordEndpointRebuild(const UbPostPath& path,
+bool RailMonitor::recordEndpointRebuild(const UbPostPath& path,
                                         uint64_t now_ns) {
-    if (!path.valid()) return;
+    if (!path.valid()) return false;
     now_ns = normalizedNow(now_ns);
     std::lock_guard<std::mutex> lock(mutex_);
     auto& state = getOrCreateLocked(path);
     now_ns = observeTimeLocked(state, now_ns);
     refreshCooldownLocked(state, now_ns);
+    if (path.endpoint_generation <= state.recorded_rebuild_generation) {
+        return false;
+    }
+    state.recorded_rebuild_generation = path.endpoint_generation;
     ++state.stats.endpoint_rebuilds;
+    return true;
 }
 
 RailStats RailMonitor::stats(const UbPostPath& path, uint64_t now_ns) {

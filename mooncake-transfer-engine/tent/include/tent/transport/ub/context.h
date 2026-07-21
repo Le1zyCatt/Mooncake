@@ -37,7 +37,20 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
 
     Status initialize(uint32_t jfc_count, const JfcOptions& options);
     Status shutdown();
-    void markUnavailable() noexcept;
+    // Returns true only for the Active -> Failed transition. Every subsequent
+    // poll error advances the failure epoch so stale successes from another
+    // JFC can never reactivate the device.
+    [[nodiscard]] bool markUnavailable() noexcept;
+    // The failure owner calls this only after every endpoint backed by this
+    // device has been unpublished and has reached Destroyed. Pending native
+    // cleanup remains quarantined and keeps this recovery barrier incomplete.
+    void completeFailureCleanup() noexcept;
+    // Pollers continue probing every JFC. A transiently failed context becomes
+    // active only after all JFCs have succeeded in the current failure epoch,
+    // the error-free cooldown has elapsed, old WRs have drained, and endpoint
+    // unpublication has completed.
+    [[nodiscard]] bool recordPollSuccess(size_t jfc_index,
+                                         uint64_t cooldown_ns) noexcept;
 
     [[nodiscard]] Topology::NicID topologyId() const noexcept {
         return topology_id_;
@@ -65,8 +78,16 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     [[nodiscard]] uint64_t outstandingWrs() const noexcept {
         return outstanding_wrs_.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] uint64_t recoveryCount() const noexcept {
+        return recovery_count_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint64_t failureStartedNs() const noexcept {
+        return failure_started_ns_.load(std::memory_order_acquire);
+    }
 
    private:
+    Status shutdownLocked();
+
     const Topology::NicID topology_id_;
     const DeviceInfo device_;
     std::shared_ptr<UrmaAdapter> adapter_;
@@ -76,6 +97,12 @@ class UbContext final : public std::enable_shared_from_this<UbContext> {
     std::atomic<State> state_{State::kUninitialized};
     std::atomic<uint64_t> inflight_bytes_{0};
     std::atomic<uint64_t> outstanding_wrs_{0};
+    std::atomic<uint64_t> failure_started_ns_{0};
+    std::atomic<uint64_t> last_failure_ns_{0};
+    std::atomic<uint64_t> recovery_count_{0};
+    uint64_t failure_epoch_{0};
+    std::vector<uint64_t> jfc_success_epochs_;
+    bool failure_cleanup_complete_{false};
 };
 
 using UbContextPtr = std::shared_ptr<UbContext>;

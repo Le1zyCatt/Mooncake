@@ -323,15 +323,25 @@ class RuntimeLease {
         return Status::OK();
     }
 
-    ~RuntimeLease() {
-        if (!acquired_) return;
+    ~RuntimeLease() { (void)release(); }
+
+    Status release() {
+        if (!acquired_) return Status::OK();
         std::lock_guard<std::mutex> lock(g_runtime_mutex);
-        if (g_runtime_reference_count == 0) return;
-        --g_runtime_reference_count;
         if (g_runtime_reference_count == 0) {
-            if (g_runtime_owned) (void)urma_uninit();
+            return Status::InternalError(
+                "URMA runtime reference count underflow");
+        }
+        if (g_runtime_reference_count == 1 && g_runtime_owned) {
+            const int rc = urma_uninit();
+            if (rc != URMA_SUCCESS) return nativeError("urma_uninit", rc);
+        }
+        --g_runtime_reference_count;
+        acquired_ = false;
+        if (g_runtime_reference_count == 0) {
             g_runtime_owned = false;
         }
+        return Status::OK();
     }
 
    private:
@@ -347,12 +357,7 @@ class RealContext final : public Context {
           info_(std::move(info)),
           native_(native) {}
 
-    ~RealContext() override {
-        if (native_ != nullptr) {
-            (void)urma_delete_context(native_);
-            native_ = nullptr;
-        }
-    }
+    ~RealContext() override { (void)close(); }
 
     bool valid() const noexcept override { return native_ != nullptr; }
     const DeviceInfo& deviceInfo() const noexcept override { return info_; }
@@ -361,6 +366,14 @@ class RealContext final : public Context {
     }
 
     urma_context_t* native() const noexcept { return native_; }
+
+    Status close() {
+        if (native_ == nullptr) return Status::OK();
+        const int rc = urma_delete_context(native_);
+        if (rc != URMA_SUCCESS) return nativeError("urma_delete_context", rc);
+        native_ = nullptr;
+        return Status::OK();
+    }
 
    private:
     std::shared_ptr<RuntimeLease> runtime_;
@@ -373,7 +386,7 @@ class RealJfc final : public Jfc {
     explicit RealJfc(std::shared_ptr<RealContext> context)
         : context_(std::move(context)) {}
 
-    ~RealJfc() override { cleanup(); }
+    ~RealJfc() override { (void)close(); }
 
     Status initialize(const JfcOptions& options) {
         if (options.enable_completion_events) {
@@ -439,7 +452,8 @@ class RealJfc final : public Jfc {
         flush_done_jetty_ids_.erase(jetty_id);
     }
 
-    Status retainSegments(const std::vector<WorkRequest>& requests) {
+    Status retainSegments(uint32_t jetty_id,
+                          const std::vector<WorkRequest>& requests) {
         std::lock_guard<std::mutex> lock(inflight_mutex_);
         std::unordered_set<uint64_t> new_tokens;
         new_tokens.reserve(requests.size());
@@ -453,8 +467,9 @@ class RealJfc final : public Jfc {
         }
         for (const WorkRequest& request : requests) {
             inflight_segments_.emplace(
-                request.token, InflightSegments{request.local_segment,
-                                                request.remote_segment});
+                request.token,
+                InflightSegments{request.local_segment, request.remote_segment,
+                                 jetty_id});
         }
         return Status::OK();
     }
@@ -465,26 +480,59 @@ class RealJfc final : public Jfc {
         inflight_segments_.erase(token);
     }
 
-   private:
-    void cleanup() noexcept {
-        if (receiver_jfr_ != nullptr) {
-            (void)urma_delete_jfr(receiver_jfr_);
-            receiver_jfr_ = nullptr;
-        }
-        if (receive_jfc_ != nullptr) {
-            (void)urma_delete_jfc(receive_jfc_);
-            receive_jfc_ = nullptr;
-        }
-        if (send_jfc_ != nullptr) {
-            (void)urma_delete_jfc(send_jfc_);
-            send_jfc_ = nullptr;
-        }
-        if (jfce_ != nullptr) {
-            (void)urma_delete_jfce(jfce_);
-            jfce_ = nullptr;
+    // A successful Jetty flush fence proves that no WR posted through that
+    // Jetty can touch its segments again. Providers are allowed to omit an
+    // individual completion after the fence, so drop any remaining retention
+    // entries by Jetty instead of waiting forever for a lost token.
+    void releaseSegmentsForJetty(uint32_t jetty_id) {
+        std::lock_guard<std::mutex> lock(inflight_mutex_);
+        for (auto it = inflight_segments_.begin();
+             it != inflight_segments_.end();) {
+            if (it->second.jetty_id == jetty_id) {
+                it = inflight_segments_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
+    Status close() {
+        std::lock_guard<std::mutex> lock(poll_mutex_);
+        {
+            std::lock_guard<std::mutex> inflight_lock(inflight_mutex_);
+            if (!inflight_segments_.empty()) {
+                return Status::TooManyRequests(
+                    "Jfc still retains in-flight segment handles");
+            }
+        }
+        if (receiver_jfr_ != nullptr) {
+            const int rc = urma_delete_jfr(receiver_jfr_);
+            if (rc != URMA_SUCCESS) return nativeError("urma_delete_jfr", rc);
+            receiver_jfr_ = nullptr;
+        }
+        if (receive_jfc_ != nullptr) {
+            const int rc = urma_delete_jfc(receive_jfc_);
+            if (rc != URMA_SUCCESS) {
+                return nativeError("urma_delete_jfc(receive)", rc);
+            }
+            receive_jfc_ = nullptr;
+        }
+        if (send_jfc_ != nullptr) {
+            const int rc = urma_delete_jfc(send_jfc_);
+            if (rc != URMA_SUCCESS) {
+                return nativeError("urma_delete_jfc(send)", rc);
+            }
+            send_jfc_ = nullptr;
+        }
+        if (jfce_ != nullptr) {
+            const int rc = urma_delete_jfce(jfce_);
+            if (rc != URMA_SUCCESS) return nativeError("urma_delete_jfce", rc);
+            jfce_ = nullptr;
+        }
+        return Status::OK();
+    }
+
+   private:
     std::shared_ptr<RealContext> context_;
     urma_jfce_t* jfce_ = nullptr;
     urma_jfc_t* send_jfc_ = nullptr;
@@ -496,6 +544,7 @@ class RealJfc final : public Jfc {
     struct InflightSegments {
         LocalSegmentPtr local;
         RemoteSegmentPtr remote;
+        uint32_t jetty_id{0};
     };
     std::mutex inflight_mutex_;
     std::unordered_map<uint64_t, InflightSegments> inflight_segments_;
@@ -512,12 +561,7 @@ class RealLocalSegment final : public LocalSegment {
           length_(length),
           descriptor_(std::move(descriptor)) {}
 
-    ~RealLocalSegment() override {
-        if (native_ != nullptr) {
-            (void)urma_unregister_seg(native_);
-            native_ = nullptr;
-        }
-    }
+    ~RealLocalSegment() override { (void)close(); }
 
     bool valid() const noexcept override { return native_ != nullptr; }
     uint64_t address() const noexcept override { return address_; }
@@ -529,6 +573,14 @@ class RealLocalSegment final : public LocalSegment {
     urma_target_seg_t* native() const noexcept { return native_; }
     const std::shared_ptr<RealContext>& context() const noexcept {
         return context_;
+    }
+
+    Status close() {
+        if (native_ == nullptr) return Status::OK();
+        const int rc = urma_unregister_seg(native_);
+        if (rc != URMA_SUCCESS) return nativeError("urma_unregister_seg", rc);
+        native_ = nullptr;
+        return Status::OK();
     }
 
    private:
@@ -550,12 +602,7 @@ class RealRemoteSegment final : public RemoteSegment {
           length_(length),
           descriptor_(std::move(descriptor)) {}
 
-    ~RealRemoteSegment() override {
-        if (native_ != nullptr) {
-            (void)urma_unimport_seg(native_);
-            native_ = nullptr;
-        }
-    }
+    ~RealRemoteSegment() override { (void)close(); }
 
     bool valid() const noexcept override { return native_ != nullptr; }
     uint64_t address() const noexcept override { return address_; }
@@ -567,6 +614,14 @@ class RealRemoteSegment final : public RemoteSegment {
     urma_target_seg_t* native() const noexcept { return native_; }
     const std::shared_ptr<RealContext>& context() const noexcept {
         return context_;
+    }
+
+    Status close() {
+        if (native_ == nullptr) return Status::OK();
+        const int rc = urma_unimport_seg(native_);
+        if (rc != URMA_SUCCESS) return nativeError("urma_unimport_seg", rc);
+        native_ = nullptr;
+        return Status::OK();
     }
 
    private:
@@ -664,6 +719,10 @@ class RealJetty final : public Jetty {
             return Status::InvalidArgument("cannot bind a reset Jetty");
         }
         if (remote_ != nullptr) {
+            if (!needs_native_unbind_ || state_ != State::BOUND) {
+                return Status::TooManyRequests(
+                    "Jetty has an imported peer pending cleanup");
+            }
             const bool same = remote_info.id == remote_id_ &&
                               remote_info.uasid == remote_uasid_ &&
                               std::memcmp(remote_eid.raw, remote_eid_.raw,
@@ -690,7 +749,24 @@ class RealJetty final : public Jetty {
 
         const int rc = urma_bind_jetty(native_, imported);
         if (rc != URMA_SUCCESS && rc != URMA_EEXIST) {
-            (void)urma_unimport_jetty(imported);
+            const int rollback_rc = urma_unimport_jetty(imported);
+            if (rollback_rc != URMA_SUCCESS) {
+                // The target Jetty was imported but never bound. Preserve the
+                // raw handle as an explicit cleanup-only phase so endpoint
+                // failure teardown can retry unimport without issuing an
+                // invalid native unbind.
+                remote_ = imported;
+                remote_eid_ = remote_eid;
+                remote_id_ = remote_info.id;
+                remote_uasid_ = remote_info.uasid;
+                needs_native_unbind_ = false;
+                return Status::InternalError(
+                    "urma_bind_jetty failed with URMA status " +
+                    std::to_string(rc) +
+                    "; rollback urma_unimport_jetty failed with URMA status " +
+                    std::to_string(rollback_rc) +
+                    "; imported target retained for retry");
+            }
             return nativeError("urma_bind_jetty", rc);
         }
 
@@ -698,7 +774,7 @@ class RealJetty final : public Jetty {
         remote_eid_ = remote_eid;
         remote_id_ = remote_info.id;
         remote_uasid_ = remote_info.uasid;
-        native_unbound_ = false;
+        needs_native_unbind_ = true;
         state_ = State::BOUND;
         return Status::OK();
     }
@@ -726,7 +802,7 @@ class RealJetty final : public Jetty {
         if (native_ == nullptr) return invalidHandle("Jetty");
         if (remote_ == nullptr) return Status::OK();
 
-        if (!native_unbound_) {
+        if (needs_native_unbind_) {
             const int unbind_rc = urma_unbind_jetty(native_);
             if (unbind_rc != URMA_SUCCESS) {
                 return nativeError("urma_unbind_jetty", unbind_rc);
@@ -734,15 +810,28 @@ class RealJetty final : public Jetty {
             // UMDK clears native_->remote_jetty on success. Preserve this
             // phase across an unimport failure so a retry does not issue an
             // invalid second unbind and can proceed directly to unimport.
-            native_unbound_ = true;
+            needs_native_unbind_ = false;
         }
         const int unimport_rc = urma_unimport_jetty(remote_);
         if (unimport_rc != URMA_SUCCESS) {
             return nativeError("urma_unimport_jetty", unimport_rc);
         }
         remote_ = nullptr;
-        native_unbound_ = false;
+        needs_native_unbind_ = false;
         if (state_ != State::RESET) state_ = State::CREATED;
+        return Status::OK();
+    }
+
+    Status close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (native_ == nullptr) return Status::OK();
+        if (remote_ != nullptr || state_ != State::RESET) {
+            return Status::InvalidArgument(
+                "Jetty must be reset and unbound before deletion");
+        }
+        const int rc = urma_delete_jetty(native_);
+        if (rc != URMA_SUCCESS) return nativeError("urma_delete_jetty", rc);
+        native_ = nullptr;
         return Status::OK();
     }
 
@@ -761,11 +850,11 @@ class RealJetty final : public Jetty {
         }
 
         if (remote_ != nullptr) {
-            if (native_unbound_ || urma_unbind_jetty(native_) == URMA_SUCCESS) {
-                native_unbound_ = true;
+            if (!needs_native_unbind_ ||
+                urma_unbind_jetty(native_) == URMA_SUCCESS) {
+                needs_native_unbind_ = false;
                 (void)urma_unimport_jetty(remote_);
                 remote_ = nullptr;
-                native_unbound_ = false;
             }
         }
         (void)urma_delete_jetty(native_);
@@ -787,7 +876,10 @@ class RealJetty final : public Jetty {
     urma_eid_t remote_eid_{};
     uint32_t remote_id_ = 0;
     uint32_t remote_uasid_ = 0;
-    bool native_unbound_{false};
+    // True only while remote_ is natively bound. A non-null remote_ with this
+    // flag clear is an imported-only cleanup phase retained after rollback or
+    // after a successful unbind followed by a failed unimport.
+    bool needs_native_unbind_{false};
     uint32_t depth_ = 0;
     State state_ = State::CREATED;
     bool flush_fenced_{false};
@@ -869,9 +961,15 @@ Completion convertCompletion(const urma_cr_t& native) {
 }
 
 template <typename Native, typename Base>
-Status resetTypedHandle(std::shared_ptr<Base>& handle, const char* name) {
+Status releaseTypedHandle(std::shared_ptr<Base>& handle, const char* name) {
     if (!handle) return Status::OK();
-    if (!std::dynamic_pointer_cast<Native>(handle)) return invalidHandle(name);
+    if (handle.use_count() != 1) {
+        return Status::TooManyRequests(std::string(name) +
+                                       " handle is still retained");
+    }
+    auto native = std::dynamic_pointer_cast<Native>(handle);
+    if (!native) return invalidHandle(name);
+    CHECK_STATUS(native->close());
     handle.reset();
     return Status::OK();
 }
@@ -894,6 +992,12 @@ class RealUrmaAdapter final : public UrmaAdapter {
 
     Status shutdown() override {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!runtime_) return Status::OK();
+        if (runtime_.use_count() != 1) {
+            return Status::TooManyRequests(
+                "URMA runtime is still retained by native handles");
+        }
+        CHECK_STATUS(runtime_->release());
         runtime_.reset();
         return Status::OK();
     }
@@ -1024,7 +1128,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
     }
 
     Status closeContext(ContextPtr& context) override {
-        return resetTypedHandle<RealContext>(context, "Context");
+        return releaseTypedHandle<RealContext>(context, "Context");
     }
 
     Status createJfc(const ContextPtr& context, const JfcOptions& options,
@@ -1056,13 +1160,20 @@ class RealUrmaAdapter final : public UrmaAdapter {
         }
 
         auto jfc = std::make_shared<RealJfc>(std::move(real_context));
-        CHECK_STATUS(jfc->initialize(options));
+        auto status = jfc->initialize(options);
+        if (!status.ok()) {
+            // initialize may already own a JFCE/JFC/JFR prefix. Return the
+            // wrapper alongside the error so the caller can retain it and
+            // drive retryable delete instead of relying on its destructor.
+            output = std::move(jfc);
+            return status;
+        }
         output = std::move(jfc);
         return Status::OK();
     }
 
     Status deleteJfc(JfcPtr& jfc) override {
-        return resetTypedHandle<RealJfc>(jfc, "Jfc");
+        return releaseTypedHandle<RealJfc>(jfc, "Jfc");
     }
 
     Status registerLocalSegment(const ContextPtr& context, uint64_t address,
@@ -1114,7 +1225,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
     }
 
     Status unregisterLocalSegment(LocalSegmentPtr& segment) override {
-        return resetTypedHandle<RealLocalSegment>(segment, "LocalSegment");
+        return releaseTypedHandle<RealLocalSegment>(segment, "LocalSegment");
     }
 
     Status importRemoteSegment(const ContextPtr& context,
@@ -1176,7 +1287,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
     }
 
     Status unimportRemoteSegment(RemoteSegmentPtr& segment) override {
-        return resetTypedHandle<RealRemoteSegment>(segment, "RemoteSegment");
+        return releaseTypedHandle<RealRemoteSegment>(segment, "RemoteSegment");
     }
 
     Status createJetty(const ContextPtr& context, const JfcPtr& jfc,
@@ -1212,13 +1323,17 @@ class RealUrmaAdapter final : public UrmaAdapter {
 
         auto jetty = std::make_shared<RealJetty>(std::move(real_context),
                                                  std::move(real_jfc));
-        CHECK_STATUS(jetty->initialize(options));
+        auto status = jetty->initialize(options);
+        if (!status.ok()) {
+            output = std::move(jetty);
+            return status;
+        }
         output = std::move(jetty);
         return Status::OK();
     }
 
     Status deleteJetty(JettyPtr& jetty) override {
-        return resetTypedHandle<RealJetty>(jetty, "Jetty");
+        return releaseTypedHandle<RealJetty>(jetty, "Jetty");
     }
 
     Status bindJetty(const JettyPtr& jetty,
@@ -1335,6 +1450,7 @@ class RealUrmaAdapter final : public UrmaAdapter {
             }
         }
         real_jfc->clearFlushDone(real_jetty->id());
+        real_jfc->releaseSegmentsForJetty(real_jetty->id());
         real_jetty->markFlushFenced();
         return Status::OK();
     }
@@ -1422,7 +1538,8 @@ class RealUrmaAdapter final : public UrmaAdapter {
         // boundary. This prevents buffer removal from unregistering memory
         // while a WR is still in flight. poll() releases the references by
         // completion token.
-        CHECK_STATUS(real_jetty->jfc()->retainSegments(requests));
+        CHECK_STATUS(
+            real_jetty->jfc()->retainSegments(real_jetty->id(), requests));
 
         urma_jfs_wr_t* bad_wr = nullptr;
         const int rc = urma_post_jetty_send_wr(

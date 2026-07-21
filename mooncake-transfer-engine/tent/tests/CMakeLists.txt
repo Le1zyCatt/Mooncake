@@ -40,8 +40,8 @@ target_include_directories(bw_arbitration_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME bw_arbitration_test COMMAND bw_arbitration_test)
 
-# Reproducible hot-path microbenchmark; intentionally not registered with
-# ctest. Run manually when changing deadline promotion partitioning.
+# Reproducible hot-path microbenchmark; intentionally not registered with ctest.
+# Run manually when changing deadline promotion partitioning.
 add_executable(deadline_promotion_bench deadline_promotion_bench.cpp
                                         ../src/runtime/admission_queue.cpp)
 target_link_libraries(deadline_promotion_bench PRIVATE tent_common)
@@ -215,6 +215,17 @@ target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
 target_include_directories(tent_ub_core_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
+
+add_executable(
+  tent_ub_teardown_test
+  ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
+  ../src/transport/ub/context.cpp ../src/transport/ub/endpoint.cpp
+  ../src/transport/ub/endpoint_store.cpp ../src/transport/ub/jfc.cpp)
+target_link_libraries(tent_ub_teardown_test PRIVATE tent_common gtest
+                                                    gtest_main)
+target_include_directories(tent_ub_teardown_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_ub_teardown_test COMMAND tent_ub_teardown_test)
 
 if(USE_UB)
   add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
