@@ -125,6 +125,7 @@ performance/vllm/index
 
 design/architecture
 design/mooncake-store
+design/ssd-explicit-delete-gc
 design/p2p-store
 design/mooncake-backend-pg
 design/mooncake-ep
