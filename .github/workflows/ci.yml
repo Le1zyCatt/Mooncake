@@ -996,6 +996,11 @@ jobs:
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF'
             need_cuda: false
+          # Exercise the native UB target with its injected mock adapter. A
+          # Debug build also catches ODR/link errors hidden by optimization.
+          - name: ub-mock
+            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            need_cuda: false
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -1070,6 +1075,17 @@ jobs:
       run: |
         cd build-tent
         ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
+      shell: bash
+
+    - name: Smoke test TENT UB benchmark CLI
+      if: matrix.name == 'ub-mock'
+      run: |
+        cd build-tent
+        help_output="$(./mooncake-transfer-engine/benchmark/tebench \
+          --backend=tent --xport_type=ub --tent_transport_hint=ub \
+          --help 2>&1)"
+        grep -q 'iouring|ub|sunrise_link' <<< "${help_output}"
+        grep -q 'ascend|ub|sunrise_link' <<< "${help_output}"
       shell: bash
 
     - name: Run sccache stat for check
