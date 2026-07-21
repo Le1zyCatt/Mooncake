@@ -68,22 +68,6 @@ bool GetEnvBoolStringOr(const char* name, bool default_value) {
     return default_value;
 }
 
-std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
-    const std::vector<std::string>& storage_keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    std::vector<OffloadTaskItem> tasks;
-    tasks.reserve(storage_keys.size());
-    for (size_t i = 0; i < storage_keys.size(); ++i) {
-        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_keys[i]);
-        const int64_t size =
-            i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = std::move(tenant_id),
-                                        .key = std::move(key),
-                                        .size = size});
-    }
-    return tasks;
-}
-
 }  // namespace
 
 FileStorageConfig FileStorageConfig::FromEnvironment() {
@@ -359,27 +343,11 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-    auto scan_meta_result = storage_backend_->ScanMeta(
-        [this](const std::vector<std::string>& keys,
-               std::vector<StorageObjectMetadata>& metadatas) {
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = local_rpc_addr_;
-            }
-            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
-            if (!add_object_result) {
-                LOG(ERROR) << "Failed to add object to master: "
-                           << add_object_result.error();
-                return add_object_result.error();
-            }
-            return ErrorCode::OK;
-        });
-
-    if (!scan_meta_result) {
-        LOG(ERROR) << "Failed to scan meta and send to master: "
-                   << scan_meta_result.error();
-        return scan_meta_result;
+    auto reconcile_result = ReRegisterOffloadedObjects();
+    if (!reconcile_result) {
+        LOG(ERROR) << "Failed to reconcile local SSD metadata with master: "
+                   << reconcile_result.error();
+        return reconcile_result;
     }
 
     heartbeat_running_.store(true);
@@ -843,6 +811,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
 
+    // A delete task is ACKed only after the holder has durably persisted its
+    // tombstone. Failures stay queued on Master and are retried next tick.
+    auto remove_result = ProcessRemoveTasks();
+    if (!remove_result) {
+        LOG(WARNING) << "SSD explicit-delete processing failed: "
+                     << remove_result.error();
+    }
+
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
     // promotion is best-effort and must never break offload.
@@ -855,6 +831,80 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     if (!disk_eviction_result) {
         LOG(WARNING) << "Disk watermark eviction failed: "
                      << disk_eviction_result.error();
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::ProcessRemoveTasks() {
+    if (client_ == nullptr) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    constexpr uint32_t kRemoveBatchLimit = 128;
+    std::vector<RemoveTaskItem> tasks;
+    auto fetch = client_->FetchRemoveTasks(kRemoveBatchLimit, tasks);
+    if (!fetch) {
+        return fetch;
+    }
+
+    if (config_.storage_backend_type != StorageBackendType::kBucket) {
+        // Master cannot distinguish the holder's local backend type. Preserve
+        // the legacy behavior of non-bucket backends (no explicit physical
+        // reclaim) without leaving reliable bucket-delete tasks permanently
+        // queued for those holders.
+        std::vector<uint64_t> unsupported_task_ids;
+        unsupported_task_ids.reserve(tasks.size());
+        for (const auto& task : tasks) {
+            unsupported_task_ids.push_back(task.task_id);
+        }
+        if (!unsupported_task_ids.empty()) {
+            LOG(WARNING) << "Acknowledging " << unsupported_task_ids.size()
+                         << " SSD remove task(s) without tombstone GC because "
+                            "the configured backend is not bucket-based";
+            return client_->AckRemoveTasks(unsupported_task_ids);
+        }
+        return {};
+    }
+
+    std::vector<uint64_t> durable_task_ids;
+    durable_task_ids.reserve(tasks.size());
+    for (auto task : tasks) {
+        task.key = MakeTenantScopedStorageKey(task.tenant_id, task.key);
+        auto removed = storage_backend_->MarkRemoved(task);
+        if (!removed) {
+            if (ssd_metric_) ssd_metric_->ssd_remove_failures.inc();
+            LOG(WARNING) << "Failed to persist SSD tombstone, task_id="
+                         << task.task_id << ", error=" << removed.error();
+            continue;
+        }
+        // Removed, already-removed, and stale-version tasks are all terminal:
+        // none can make the requested incarnation visible locally.
+        durable_task_ids.push_back(task.task_id);
+        if (ssd_metric_) ssd_metric_->ssd_remove_tasks.inc();
+    }
+
+    if (!durable_task_ids.empty()) {
+        auto ack = client_->AckRemoveTasks(durable_task_ids);
+        if (!ack) {
+            // MarkRemoved is idempotent, so an ACK loss is safe to retry.
+            return ack;
+        }
+    }
+
+    auto gc = storage_backend_->RunTombstoneGC(1);
+    if (!gc) {
+        LOG(WARNING) << "Single-bucket tombstone GC failed: " << gc.error();
+        return tl::make_unexpected(gc.error());
+    }
+    if (gc->buckets_compacted > 0) {
+        if (ssd_metric_) {
+            ssd_metric_->ssd_gc_buckets.inc(gc->buckets_compacted);
+            ssd_metric_->ssd_gc_reclaimed_bytes.inc(
+                gc->physical_bytes_reclaimed);
+        }
+        LOG(INFO) << "SSD tombstone GC compacted " << gc->buckets_compacted
+                  << " bucket(s), reclaimed " << gc->physical_bytes_reclaimed
+                  << " physical bytes";
     }
     return {};
 }
@@ -1193,8 +1243,8 @@ bool FileStorage::ReleaseBuffer(uint64_t batch_id) {
 }
 
 tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
-    LOG(INFO) << "ReRegisterOffloadedObjects: starting ScanMeta to re-register "
-              << "offloaded objects with master";
+    LOG(INFO) << "ReRegisterOffloadedObjects: reconciling local SSD objects "
+              << "with master";
     int total_keys = 0;
     int total_batches = 0;
     int total_failures = 0;
@@ -1205,33 +1255,93 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     storage_backend_->ResetScanIterator();
     LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
                  "storage_backend_->ScanMeta()";
-    auto scan_meta_result =
-        storage_backend_->ScanMeta(
-            [this, &total_keys, &total_batches, &total_failures](
-                const std::vector<std::string>& keys,
-                std::vector<StorageObjectMetadata>& metadatas) {
-                total_batches++;
-                total_keys += keys.size();
-                for (auto& metadata : metadatas) {
-                    metadata.transport_endpoint = local_rpc_addr_;
+    auto scan_meta_result = storage_backend_->ScanMeta(
+        [this, &total_keys, &total_batches, &total_failures](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) {
+            total_batches++;
+            total_keys += keys.size();
+
+            if (config_.storage_backend_type != StorageBackendType::kBucket) {
+                std::vector<OffloadTaskItem> tasks;
+                tasks.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    auto [tenant_id, key] =
+                        ParseTenantScopedStorageKey(keys[i]);
+                    metadatas[i].transport_endpoint = local_rpc_addr_;
+                    tasks.push_back(
+                        OffloadTaskItem{.tenant_id = std::move(tenant_id),
+                                        .key = std::move(key),
+                                        .size = metadatas[i].data_size});
                 }
-                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-                auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
-                if (!add_object_result) {
-                    total_failures++;
-                    LOG(ERROR)
-                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                        << "failed for batch " << total_batches << " with "
-                        << keys.size()
-                        << " keys, error: " << add_object_result.error();
-                    return add_object_result.error();
+                auto refresh = client_->NotifyOffloadSuccess(tasks, metadatas);
+                if (!refresh) {
+                    ++total_failures;
+                    return refresh.error();
                 }
-                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                          << "succeeded for batch " << total_batches << " with "
-                          << keys.size() << " keys";
                 return ErrorCode::OK;
-            });
+            }
+
+            constexpr size_t kReconcileBatchLimit = 1024;
+            for (size_t begin = 0; begin < keys.size();
+                 begin += kReconcileBatchLimit) {
+                const size_t end =
+                    std::min(keys.size(), begin + kReconcileBatchLimit);
+                std::vector<LocalDiskObjectInfo> objects;
+                objects.reserve(end - begin);
+                for (size_t i = begin; i < end; ++i) {
+                    auto [tenant_id, key] =
+                        ParseTenantScopedStorageKey(keys[i]);
+                    objects.push_back(LocalDiskObjectInfo{
+                        .tenant_id = std::move(tenant_id),
+                        .key = std::move(key),
+                        .object_version = metadatas[i].object_version,
+                        .data_size = metadatas[i].data_size});
+                }
+
+                auto matches = client_->BatchCheckLocalDiskReplicas(objects);
+                if (!matches || matches->size() != objects.size()) {
+                    ++total_failures;
+                    return matches ? ErrorCode::INTERNAL_ERROR
+                                   : matches.error();
+                }
+
+                std::vector<OffloadTaskItem> live_tasks;
+                std::vector<StorageObjectMetadata> live_metadatas;
+                for (size_t offset = 0; offset < objects.size(); ++offset) {
+                    const size_t i = begin + offset;
+                    if (!(*matches)[offset]) {
+                        RemoveTaskItem orphan{
+                            .tenant_id = objects[offset].tenant_id,
+                            .key = keys[i],
+                            .object_version = objects[offset].object_version,
+                            .data_size = objects[offset].data_size};
+                        auto removed = storage_backend_->MarkRemoved(orphan);
+                        if (!removed) {
+                            ++total_failures;
+                            return removed.error();
+                        }
+                        continue;
+                    }
+                    metadatas[i].transport_endpoint = local_rpc_addr_;
+                    live_tasks.push_back(
+                        OffloadTaskItem{.tenant_id = objects[offset].tenant_id,
+                                        .key = objects[offset].key,
+                                        .size = objects[offset].data_size});
+                    live_metadatas.push_back(metadatas[i]);
+                }
+
+                if (!live_tasks.empty()) {
+                    auto refresh = client_->NotifyOffloadSuccess(
+                        live_tasks, live_metadatas);
+                    if (!refresh) {
+                        ++total_failures;
+                        return refresh.error();
+                    }
+                }
+            }
+            return ErrorCode::OK;
+        });
 
     LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
               << scan_meta_result.has_value();

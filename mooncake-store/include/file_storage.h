@@ -83,10 +83,12 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
-     * 4. If offload work was returned, pulls and processes any pending L2->L1
+     * 4. Persists and acknowledges a bounded batch of explicit-delete
+     *    tombstones, then advances single-bucket GC.
+     * 5. Pulls and processes any pending L2->L1
      *    promotion tasks queued by the master (mirror of step 1+2 in the
      *    reverse direction).
-     * 5. Runs proactive local-disk watermark eviction.
+     * 6. Runs proactive local-disk watermark eviction.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
@@ -102,6 +104,9 @@ class FileStorage {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
+
+    /** Persists a bounded batch of holder-specific delete tasks before ACK. */
+    tl::expected<void, ErrorCode> ProcessRemoveTasks();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 

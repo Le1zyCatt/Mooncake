@@ -542,6 +542,17 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          ssd_remove_tasks("mooncake_ssd_remove_tasks_total",
+                           "SSD explicit-delete tasks durably resolved",
+                           labels),
+          ssd_remove_failures("mooncake_ssd_remove_failures_total",
+                              "SSD explicit-delete persistence failures",
+                              labels),
+          ssd_gc_buckets("mooncake_ssd_gc_buckets_total",
+                         "SSD buckets compacted for tombstone GC", labels),
+          ssd_gc_reclaimed_bytes("mooncake_ssd_gc_reclaimed_bytes_total",
+                                 "Physical SSD bytes reclaimed by tombstone GC",
+                                 labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -556,6 +567,10 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::counter_t ssd_remove_tasks;
+    ylt::metric::counter_t ssd_remove_failures;
+    ylt::metric::counter_t ssd_gc_buckets;
+    ylt::metric::counter_t ssd_gc_reclaimed_bytes;
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
@@ -571,6 +586,10 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        ssd_remove_tasks.serialize(str);
+        ssd_remove_failures.serialize(str);
+        ssd_gc_buckets.serialize(str);
+        ssd_gc_reclaimed_bytes.serialize(str);
     }
 
     std::string summary_metrics() {
