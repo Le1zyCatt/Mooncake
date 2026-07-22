@@ -313,6 +313,7 @@ TEST_F(MasterServiceSSDSnapshotTest, RemoveKey) {
 TEST_F(MasterServiceSSDSnapshotTest,
        PendingLocalDiskRemoveTaskRoundTripsUntilAck) {
     MasterServiceConfig config;
+    config.enable_offload = true;
     config.default_kv_lease_ttl = 0;
     CreateMasterServiceWithSSDFeatAndConfig(config);
 

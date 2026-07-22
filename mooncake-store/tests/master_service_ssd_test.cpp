@@ -31,13 +31,18 @@ class MasterServiceSSDTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+std::unique_ptr<MasterService> CreateSsdAwareOffloadService(
+    MasterServiceConfig config) {
+    config.enable_offload = true;
+    return std::make_unique<MasterService>(config);
+}
+
 std::unique_ptr<MasterService> CreateSsdAwareOffloadService() {
     MasterServiceConfig config;
-    config.enable_offload = true;
     config.default_kv_lease_ttl = 0;
     config.allocation_strategy_type =
         AllocationStrategyType::SSD_FREE_RATIO_FIRST;
-    return std::make_unique<MasterService>(config);
+    return CreateSsdAwareOffloadService(config);
 }
 
 void MountMemoryAndLocalDisk(MasterService& service, const UUID& client_id,
@@ -433,7 +438,7 @@ TEST_F(MasterServiceSSDTest, RemoveFetchIsAtLeastOnceAndAckIsIdempotent) {
 TEST_F(MasterServiceSSDTest, BatchRemoveQueuesOnlySuccessfulKeys) {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = 0;
-    auto service = std::make_unique<MasterService>(config);
+    auto service = CreateSsdAwareOffloadService(config);
     const UUID holder = generate_uuid();
     ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
     AddLocalDiskOnlyObject(*service, holder, "present", "default", 32,
@@ -471,7 +476,7 @@ TEST_F(MasterServiceSSDTest, RemoveTasksAreTenantScoped) {
                       .set_tenant_quota_connector_uri(policy_path.string())
                       .set_default_kv_lease_ttl(0)
                       .build();
-    auto service = std::make_unique<MasterService>(config);
+    auto service = CreateSsdAwareOffloadService(config);
     const UUID holder = generate_uuid();
     ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
     AddLocalDiskOnlyObject(*service, holder, "same-key", "tenant-a", 16,
@@ -493,7 +498,7 @@ TEST_F(MasterServiceSSDTest, RemoveQueueLimitPreservesObjectMetadata) {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = 0;
     config.offloading_queue_limit = 1;
-    auto service = std::make_unique<MasterService>(config);
+    auto service = CreateSsdAwareOffloadService(config);
     const UUID holder = generate_uuid();
     ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
     AddLocalDiskOnlyObject(*service, holder, "first", "default", 16,
@@ -511,7 +516,7 @@ TEST_F(MasterServiceSSDTest, RemoveQueueLimitPreservesObjectMetadata) {
 TEST_F(MasterServiceSSDTest, FetchRemoveTasksHonorsRequestedBatchLimit) {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = 0;
-    auto service = std::make_unique<MasterService>(config);
+    auto service = CreateSsdAwareOffloadService(config);
     const UUID holder = generate_uuid();
     ASSERT_TRUE(service->MountLocalDiskSegment(holder, true).has_value());
     AddLocalDiskOnlyObject(*service, holder, "limited-1", "default", 16,
@@ -530,7 +535,7 @@ TEST_F(MasterServiceSSDTest,
        BatchRemoveRetainsTaskForOfflineHolderUntilRemount) {
     MasterServiceConfig config;
     config.default_kv_lease_ttl = 0;
-    auto service = std::make_unique<MasterService>(config);
+    auto service = CreateSsdAwareOffloadService(config);
     const UUID holder = generate_uuid();
     const UUID version = generate_uuid();
     AddLocalDiskOnlyObject(*service, holder, "offline-key", "default", 16,
@@ -550,7 +555,7 @@ TEST_F(MasterServiceSSDTest,
 
 TEST_F(MasterServiceSSDTest, BatchCheckRequiresExactHolderVersionAndSize) {
     MasterServiceConfig config;
-    auto service = std::make_unique<MasterService>(config);
+    auto service = CreateSsdAwareOffloadService(config);
     const UUID holder = generate_uuid();
     const UUID other = generate_uuid();
     const UUID version = generate_uuid();

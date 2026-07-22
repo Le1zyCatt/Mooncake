@@ -716,7 +716,10 @@ SegmentSerializer::Serialize() {
             packer.pack(task.size);
         }
         packer.pack(segment->ssd_total_capacity_bytes);
-        packer.pack(segment->connected);
+        // Connection liveness is process-local and cannot survive recovery.
+        // Keep the field for snapshot compatibility, but write a canonical
+        // value so persisting a restored snapshot remains deterministic.
+        packer.pack(false);
         packer.pack(segment->remove_fetch_cursor);
         packer.pack_array(segment->remove_tasks.size());
         for (const auto& [task_id, state] : segment->remove_tasks) {
