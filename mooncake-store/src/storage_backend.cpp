@@ -2180,7 +2180,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         object_meta.key_size,
                         object_meta.data_size,
                         "",
-                        object_meta.object_version};
+                        object_meta.ObjectVersion()};
                     auto existing = object_bucket_map_.find(meta.keys[i]);
                     if (existing == object_bucket_map_.end() ||
                         existing->second.bucket_id < metadata_it->first) {
@@ -2462,7 +2462,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::CompactBucket(
             if (object_it == object_bucket_map_.end() ||
                 object_it->second.bucket_id != bucket_id ||
                 object_it->second.object_version !=
-                    old_bucket->metadatas[i].object_version) {
+                    old_bucket->metadatas[i].ObjectVersion()) {
                 continue;
             }
             live_entries.emplace_back(key, old_bucket->metadatas[i]);
@@ -2546,7 +2546,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::CompactBucket(
             return tl::make_unexpected(read ? ErrorCode::FILE_READ_FAIL
                                             : read.error());
         }
-        versions.emplace(key, metadata.object_version);
+        versions.emplace(key, metadata.ObjectVersion());
     }
 
     std::unordered_map<std::string, std::vector<Slice>> batch;
@@ -2565,7 +2565,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::CompactBucket(
     new_bucket->compacted_from_bucket_id = bucket_id;
     for (size_t i = 0; i < new_bucket->keys.size(); ++i) {
         const UUID version = versions.at(new_bucket->keys[i]);
-        new_bucket->metadatas[i].object_version = version;
+        new_bucket->metadatas[i].SetObjectVersion(version);
         new_objects[i].object_version = version;
     }
     // Write durable data and a durable staging metadata file. The final .meta
@@ -2601,7 +2601,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::CompactBucket(
             auto object_it = object_bucket_map_.find(key);
             if (object_it == object_bucket_map_.end() ||
                 object_it->second.bucket_id != bucket_id ||
-                object_it->second.object_version != metadata.object_version) {
+                object_it->second.object_version != metadata.ObjectVersion()) {
                 lock.unlock();
                 cleanup_staged();
                 CleanupOrphanedBucket(new_bucket_id);
@@ -2780,7 +2780,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
                 bucket_it->second->metadatas[i].key_size,
                 bucket_it->second->metadatas[i].data_size, "",
-                bucket_it->second->metadatas[i].object_version});
+                bucket_it->second->metadatas[i].ObjectVersion()});
         }
     }
     return 0;
@@ -2927,7 +2927,7 @@ BucketStorageBackend::BuildBucket(
         bucket->data_size += object_total_size + object.first.size();
         bucket->metadatas.emplace_back(BucketObjectMetadata{
             storage_offset, static_cast<int64_t>(object.first.size()),
-            object_total_size, object_version});
+            object_total_size, object_version.first, object_version.second});
         metadatas.emplace_back(
             StorageObjectMetadata{bucket_id, storage_offset,
                                   static_cast<int64_t>(object.first.size()),
@@ -3292,7 +3292,7 @@ BucketStorageBackend::SelectEvictionCandidate() {
                                         std::memory_order_acquire);
                                 });
 
-        case BucketEvictionPolicy::LRU:
+        case BucketEvictionPolicy::LRU: {
             // Use lru_index_ (a std::set ordered by {last_access_ns_,
             // bucket_id}) for O(log N) candidate selection.
             //
@@ -3338,6 +3338,7 @@ BucketStorageBackend::SelectEvictionCandidate() {
             }
             lru_index_.insert(deferred_busy.begin(), deferred_busy.end());
             return buckets_.end();
+        }
 
         default:
             return buckets_.end();
@@ -3512,7 +3513,7 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
                                       object_meta.key_size,
                                       object_meta.data_size,
                                       "",
-                                      object_meta.object_version};
+                                      object_meta.ObjectVersion()};
         }
         total_size_ += bucket_meta->data_size + bucket_meta->meta_size;
         if (bucket_backend_config_.eviction_policy ==

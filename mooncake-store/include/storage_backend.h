@@ -30,9 +30,23 @@ struct BucketObjectMetadata {
     int64_t offset;
     int64_t key_size;
     int64_t data_size;
-    UUID object_version{0, 0};
+    // struct_pb is implemented by iguana, whose protobuf codec does not
+    // support std::pair. UUID is a std::pair in the public API, so persist its
+    // two components as protobuf scalar fields and convert at the boundary.
+    uint64_t object_version_first{0};
+    uint64_t object_version_second{0};
+
+    UUID ObjectVersion() const {
+        return {object_version_first, object_version_second};
+    }
+
+    void SetObjectVersion(const UUID& object_version) {
+        object_version_first = object_version.first;
+        object_version_second = object_version.second;
+    }
 };
-YLT_REFL(BucketObjectMetadata, offset, key_size, data_size, object_version);
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size,
+         object_version_first, object_version_second);
 
 struct BucketMetadata {
     int64_t meta_size;
